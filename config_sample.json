@@ -1,0 +1,21 @@
+{
+    "job_id": "<YOUR_JOB_ID>",
+    "mode": "MONGODUMP_STAGE",
+    "source_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<SOURCE_CLUSTER_URL>/",
+    "dest_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<DESTINATION_CLUSTER_URL>/",
+    "bookkeeping_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<BOOKKEEPING_CLUSTER_URL>/",
+    "source_db": "<SOURCE_DATABASE_NAME>",
+    "source_collection": "<SOURCE_COLLECTION_NAME>",
+    "dest_db": "<DESTINATION_DATABASE_NAME>",
+    "dest_collection": "<DESTINATION_COLLECTION_NAME>",
+    "staging_root": "<PATH_TO_STAGING_DIRECTORY>",
+    "chunk_window_hours": 1,
+    "max_docs_per_chunk": 10000,
+    "max_retries": 3,
+    "src_batch_size": 2000,
+    "dest_batch_size": 500,
+    "stream_workers": 4,
+    "dump_workers": 4,
+    "load_workers": 4,
+    "max_backlog_chunks": 10
+}
