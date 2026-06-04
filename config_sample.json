@@ -1,6 +1,6 @@
 {
     "job_id": "<YOUR_JOB_ID>",
-    "mode": "MONGODUMP_STAGE",
+    "mode": "MONGODUMP_STAGE | DIRECT_STREAM",
     "source_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<SOURCE_CLUSTER_URL>/",
     "dest_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<DESTINATION_CLUSTER_URL>/",
     "bookkeeping_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<BOOKKEEPING_CLUSTER_URL>/",

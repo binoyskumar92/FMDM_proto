@@ -124,129 +124,140 @@ def lease_next_chunk(
 # ==========================================
 # MODULE 3: DENSITY-AWARE CHUNK PLANNER
 # ==========================================
-def get_safe_upper_bound(
-    coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk, min_window_seconds=1
-):
-    """Recursively shrinks time window using index counts to prevent hot chunk skew."""
-    doc_count = coll.count_documents(
-        {"_id": {"$gte": lower_bound_oid, "$lt": naive_upper_oid}}
-    )
+def get_safe_upper_bound(coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk, min_window_seconds=1):
+        """Recursively shrinks time window using index counts to prevent hot chunk skew."""
+        doc_count = coll.count_documents({"_id": {"$gte": lower_bound_oid, "$lt": naive_upper_oid}})
+        
+        if doc_count <= max_docs_per_chunk:
+            return naive_upper_oid, doc_count
+            
+        lower_time = lower_bound_oid.generation_time
+        upper_time = naive_upper_oid.generation_time
+        time_diff_seconds = (upper_time - lower_time).total_seconds()
+        
+        # Base case: We hit the minimum allowed window (e.g., 1 second spike)
+        if time_diff_seconds <= min_window_seconds:
+            return naive_upper_oid, doc_count
+            
+        halfway_time = lower_time + timedelta(seconds=time_diff_seconds / 2)
+        new_naive_upper_oid = ObjectId.from_datetime(halfway_time)
+        
+        return get_safe_upper_bound(coll, lower_bound_oid, new_naive_upper_oid, max_docs_per_chunk, min_window_seconds)
 
-    if doc_count <= max_docs_per_chunk:
-        return naive_upper_oid, doc_count
-
+def get_optimal_upper_bound(coll, lower_bound_oid, initial_window_hours, max_docs_per_chunk, max_expansion_hours=24):
+    """
+    Bi-directional planner: 
+    Expands time window if under 50% capacity, shrinks if over 100% capacity.
+    """
+    min_docs_per_chunk = int(max_docs_per_chunk * 0.5) # Hardcoded 50% target threshold
+    
     lower_time = lower_bound_oid.generation_time
-    upper_time = naive_upper_oid.generation_time
-    time_diff_seconds = (upper_time - lower_time).total_seconds()
-
-    if time_diff_seconds <= min_window_seconds:
-        return naive_upper_oid, doc_count
-
-    halfway_time = lower_time + timedelta(seconds=time_diff_seconds / 2)
-    new_naive_upper_oid = ObjectId.from_datetime(halfway_time)
-
-    return get_safe_upper_bound(
-        coll,
-        lower_bound_oid,
-        new_naive_upper_oid,
-        max_docs_per_chunk,
-        min_window_seconds,
-    )
-
+    current_window = timedelta(hours=initial_window_hours)
+    naive_upper_oid = ObjectId.from_datetime(lower_time + current_window)
+    
+    doc_count = coll.count_documents({"_id": {"$gte": lower_bound_oid, "$lt": naive_upper_oid}})
+    
+    # If exactly 0, return immediately so the fast-forward logic in the main loop can skip the gap
+    if doc_count == 0:
+        return naive_upper_oid, 0
+        
+    # 1. EXPANSION PHASE (Too few docs, "The Trickle")
+    # Keep doubling the window until we hit 50% capacity or hit the 24-hour safety cap
+    while doc_count < min_docs_per_chunk and current_window.total_seconds() < (max_expansion_hours * 3600):
+        current_window *= 2 
+        naive_upper_oid = ObjectId.from_datetime(lower_time + current_window)
+        doc_count = coll.count_documents({"_id": {"$gte": lower_bound_oid, "$lt": naive_upper_oid}})
+        
+    # 2. SHRINK PHASE (Too many docs, "The Spike")
+    # If the initial window (or an overzealous expansion) overshot the maximum, shrink it back down safely
+    if doc_count > max_docs_per_chunk:
+        return get_safe_upper_bound(coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk)
+        
+    return naive_upper_oid, doc_count
 
 def plan_chunks(job_config):
-    """Generates sequential, density-aware chunk boundaries."""
-    bk_client = MongoClient(job_config["bookkeeping_uri"])
+    """Generates sequential, density-aware chunk boundaries with timer."""
+    bk_client = MongoClient(job_config['bookkeeping_uri'])
     db = bk_client["masking_control"]
-
+    
     # If chunks already exist, skip planning (Resume mode)
     if db.chunks.count_documents({"job_id": job_config["job_id"]}) > 0:
         logging.info("Chunks already exist. Skipping planning phase.")
         return
 
-    db.jobs.update_one(
-        {"job_id": job_config["job_id"]}, {"$set": {"status": "PLANNING"}}
-    )
-
-    src_client = MongoClient(job_config["source_uri"])
-    coll = src_client[job_config["source_db"]][job_config["source_collection"]]
-
+    db.jobs.update_one({"job_id": job_config["job_id"]}, {"$set": {"status": "PLANNING"}})
+    
+    src_client = MongoClient(job_config['source_uri'])
+    coll = src_client[job_config['source_db']][job_config['source_collection']]
+    
     min_doc = list(coll.find({}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
     max_doc = list(coll.find({}, {"_id": 1}).sort("_id", -1).limit(1).hint("_id_"))
-
+    
     if not min_doc or not max_doc:
         logging.info("Source collection is empty.")
-        db.jobs.update_one(
-            {"job_id": job_config["job_id"]}, {"$set": {"status": "COMPLETED"}}
-        )
+        db.jobs.update_one({"job_id": job_config["job_id"]}, {"$set": {"status": "COMPLETED"}})
         return
-
+        
     global_min_id = min_doc[0]["_id"]
     global_max_id = max_doc[0]["_id"]
-
+    
     current_lower_bound = global_min_id
     seq = 1
     ready_status = "READY" if job_config["mode"] == "DIRECT_STREAM" else "READY_TO_DUMP"
     chunks_to_insert = []
-
-    logging.info("Starting density-aware chunk planning...")
-    planning_start_time = time.time()
+    
+    logging.info("Starting bi-directional density-aware chunk planning...")
+    planning_start_time = time.time() # START CLOCK
+    
     while current_lower_bound < global_max_id:
-        naive_next_time = current_lower_bound.generation_time + timedelta(
-            hours=job_config["chunk_window_hours"]
+        
+        # Calculate optimal boundary using expand/shrink logic
+        safe_upper_bound, estimated_count = get_optimal_upper_bound(
+            coll, current_lower_bound, job_config["chunk_window_hours"], job_config["max_docs_per_chunk"]
         )
-        naive_upper_bound = ObjectId.from_datetime(naive_next_time)
-
-        safe_upper_bound, estimated_count = get_safe_upper_bound(
-            coll,
-            current_lower_bound,
-            naive_upper_bound,
-            job_config["max_docs_per_chunk"],
-        )
-
+        
         # Fast-forward over empty gaps (Gap Compression)
         if estimated_count == 0:
-            next_real_doc = list(
-                coll.find({"_id": {"$gte": safe_upper_bound}}, {"_id": 1})
-                .sort("_id", 1)
-                .limit(1)
-                .hint("_id_")
-            )
+            next_real_doc = list(coll.find({"_id": {"$gte": safe_upper_bound}}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
             if not next_real_doc:
                 break
             current_lower_bound = next_real_doc[0]["_id"]
             continue
-
-        chunks_to_insert.append(
-            {
-                "chunk_id": f"{job_config['job_id']}_{seq}",
-                "job_id": job_config["job_id"],
-                "chunk_sequence": seq,
-                "lower_bound": current_lower_bound,
-                "upper_bound": safe_upper_bound,
-                "bytes_read_estimate": estimated_count,
-                "status": ready_status,
-                "attempts": 0,
-            }
-        )
-
+            
+        chunks_to_insert.append({
+            "chunk_id": f"{job_config['job_id']}_{seq}",
+            "job_id": job_config["job_id"],
+            "chunk_sequence": seq,
+            "lower_bound": current_lower_bound,
+            "upper_bound": safe_upper_bound,
+            "bytes_read_estimate": estimated_count,
+            "status": ready_status,
+            "attempts": 0
+        })
+        
         current_lower_bound = safe_upper_bound
         seq += 1
-
+        
         # Batch insert to bookkeeping to save memory
         if len(chunks_to_insert) >= 1000:
             db.chunks.insert_many(chunks_to_insert)
             chunks_to_insert = []
 
-    planning_duration = time.time() - planning_start_time
+    # STOP CLOCK
+    planning_duration = time.time() - planning_start_time 
+
     if chunks_to_insert:
         db.chunks.insert_many(chunks_to_insert)
-
+        
     db.jobs.update_one(
-        {"job_id": job_config["job_id"]},
-        {"$set": {"status": "RUNNING", "total_chunks": seq - 1, "planning_duration_seconds": round(planning_duration, 2)}},
+        {"job_id": job_config["job_id"]}, 
+        {"$set": {
+            "status": "RUNNING", 
+            "total_chunks": seq - 1,
+            "planning_duration_seconds": round(planning_duration, 2)
+        }}
     )
-    logging.info(f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks.")
+    logging.info(f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks.") 
 
 
 # ==========================================
