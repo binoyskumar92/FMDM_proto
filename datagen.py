@@ -4,10 +4,10 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 
 # --- CONFIGURATION ---
-MONGO_URI = "mongodb+srv://mongoadmin:passwordone@test.hvabt.mongodb.net/"
+MONGO_URI = "mongodb+srv://mongoadmin:passwordone@cluster0.hvabt.mongodb.net/"
 DB_NAME = "sample_airbnb"
-SOURCE_COLLECTION = "listingsAndReviews"
-TARGET_COLLECTION = "listingsAndReviews_loadtest"
+SOURCE_COLLECTION = "listingsAndReviews_loadtest"
+TARGET_COLLECTION = "listingsAndReviews_loadtest_push"
 
 MULTIPLIER = 50           # How many times to duplicate the dataset
 BATCH_SIZE = 3000         # Number of docs to insert per batch
