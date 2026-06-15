@@ -12,6 +12,7 @@ from concurrent.futures import ProcessPoolExecutor
 import bson
 import pymongo
 from pymongo import UpdateOne, MongoClient
+from pymongo.errors import BulkWriteError
 from bson.objectid import ObjectId
 
 logging.basicConfig(
@@ -85,10 +86,11 @@ def lease_next_chunk(
     active_status: str,
     worker_id: str,
     max_attempts: int = 3,
+    lease_hours: float = 1,
 ):
     """Atomically finds and leases the next available chunk."""
     now = datetime.now(timezone.utc)
-    lease_expiration = now + timedelta(hours=1)
+    lease_expiration = now + timedelta(hours=lease_hours)
 
     # Find a chunk that is ready, OR a chunk whose lease has expired, AND is under max attempts
     query = {
@@ -458,6 +460,182 @@ def plan_chunks(job_config):
     logging.info(f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks.")
 
 
+
+
+# ==========================================
+# DESTINATION WRITE STRATEGIES
+# ==========================================
+DEST_WRITE_MODE_UPSERT = "UPSERT"
+DEST_WRITE_MODE_INSERT_THEN_UPSERT_ON_DUP = "INSERT_THEN_UPSERT_ON_DUP"
+SUPPORTED_DEST_WRITE_MODES = {
+    DEST_WRITE_MODE_UPSERT,
+    DEST_WRITE_MODE_INSERT_THEN_UPSERT_ON_DUP,
+}
+
+
+def _empty_write_stats() -> dict:
+    return {
+        "docs_seen": 0,
+        "docs_inserted": 0,
+        "docs_matched": 0,
+        "docs_modified": 0,
+        "docs_upserted": 0,
+        "docs_upserted_after_duplicate": 0,
+        "duplicate_key_errors": 0,
+        "batches_written": 0,
+    }
+
+
+def _merge_write_stats(total: dict, increment: dict) -> dict:
+    for key, value in increment.items():
+        total[key] = total.get(key, 0) + value
+    return total
+
+
+def _get_dest_write_mode(job_config: dict) -> str:
+    """
+    Keep this intentionally simple. There are only two supported write modes:
+
+      UPSERT
+        Original behavior. Every write is UpdateOne(..., upsert=True).
+        Best resumability and simplest operational behavior.
+
+      INSERT_THEN_UPSERT_ON_DUP
+        Fast path is insert_many(..., ordered=False).
+        If a retry hits duplicate _id errors, only those duplicate docs are
+        upserted. This keeps resumability while making clean chunks use inserts.
+    """
+    mode = job_config.get("dest_write_mode", DEST_WRITE_MODE_UPSERT).upper()
+
+    if mode not in SUPPORTED_DEST_WRITE_MODES:
+        raise ValueError(
+            f"Unsupported dest_write_mode: {mode!r}. "
+            f"Supported values: {sorted(SUPPORTED_DEST_WRITE_MODES)}"
+        )
+
+    return mode
+
+
+def _is_duplicate_key_error(error_doc: dict) -> bool:
+    return error_doc.get("code") == 11000
+
+
+def write_dest_batch(dest_coll, docs: list, job_config: dict) -> dict:
+    """
+    Write a batch of transformed destination documents.
+
+    Mode 1, UPSERT:
+      Uses bulk_write with UpdateOne(..., upsert=True) for every document.
+      This is the safest and original behavior.
+
+    Mode 2, INSERT_THEN_UPSERT_ON_DUP:
+      Uses insert_many first. If duplicate key errors happen, only those
+      duplicate docs are retried using upsert. Non-duplicate write errors fail
+      the chunk.
+
+    The second mode is still resumable:
+      - If a chunk partially wrote before a crash, retrying the chunk inserts
+        missing docs and upserts duplicate docs.
+      - If a chunk fully wrote but failed before status update, retrying the
+        chunk upserts the duplicate docs and then marks the chunk completed.
+    """
+    if not docs:
+        return _empty_write_stats()
+
+    mode = _get_dest_write_mode(job_config)
+
+    if mode == DEST_WRITE_MODE_UPSERT:
+        ops = [
+            UpdateOne(
+                {"_id": doc["_id"]},
+                {"$set": doc},
+                upsert=True,
+            )
+            for doc in docs
+        ]
+
+        result = dest_coll.bulk_write(ops, ordered=False)
+        return {
+            "docs_seen": len(docs),
+            "docs_inserted": 0,
+            "docs_matched": result.matched_count,
+            "docs_modified": result.modified_count,
+            "docs_upserted": result.upserted_count,
+            "docs_upserted_after_duplicate": 0,
+            "duplicate_key_errors": 0,
+            "batches_written": 1,
+        }
+
+    # INSERT_THEN_UPSERT_ON_DUP
+    try:
+        result = dest_coll.insert_many(docs, ordered=False)
+        return {
+            "docs_seen": len(docs),
+            "docs_inserted": len(result.inserted_ids),
+            "docs_matched": 0,
+            "docs_modified": 0,
+            "docs_upserted": 0,
+            "docs_upserted_after_duplicate": 0,
+            "duplicate_key_errors": 0,
+            "batches_written": 1,
+        }
+
+    except BulkWriteError as exc:
+        details = exc.details or {}
+        write_errors = details.get("writeErrors", [])
+
+        non_duplicate_errors = [
+            err for err in write_errors
+            if not _is_duplicate_key_error(err)
+        ]
+        if non_duplicate_errors:
+            raise
+
+        duplicate_indexes = sorted(
+            {
+                err["index"]
+                for err in write_errors
+                if _is_duplicate_key_error(err) and "index" in err
+            }
+        )
+
+        duplicate_docs = [
+            docs[i]
+            for i in duplicate_indexes
+            if 0 <= i < len(docs)
+        ]
+
+        stats = {
+            "docs_seen": len(docs),
+            "docs_inserted": details.get("nInserted", 0),
+            "docs_matched": 0,
+            "docs_modified": 0,
+            "docs_upserted": 0,
+            "docs_upserted_after_duplicate": 0,
+            "duplicate_key_errors": len(duplicate_docs),
+            "batches_written": 1,
+        }
+
+        if duplicate_docs:
+            ops = [
+                UpdateOne(
+                    {"_id": doc["_id"]},
+                    {"$set": doc},
+                    upsert=True,
+                )
+                for doc in duplicate_docs
+            ]
+
+            fallback_result = dest_coll.bulk_write(ops, ordered=False)
+            stats["docs_matched"] += fallback_result.matched_count
+            stats["docs_modified"] += fallback_result.modified_count
+            stats["docs_upserted"] += fallback_result.upserted_count
+            stats["docs_upserted_after_duplicate"] += len(duplicate_docs)
+            stats["batches_written"] += 1
+
+        return stats
+
+
 # ==========================================
 # MODULE 4: WORKER IMPLEMENTATIONS
 # ==========================================
@@ -478,6 +656,7 @@ def direct_stream_worker(worker_id: str, job_config: dict):
             "STREAMING",
             worker_id,
             job_config["max_retries"],
+            job_config.get("lease_hours", 1),
         )
         if not chunk:
             time.sleep(5)
@@ -505,24 +684,25 @@ def direct_stream_worker(worker_id: str, job_config: dict):
 
             batch = []
             docs_read = 0
+            write_stats = _empty_write_stats()
 
             for doc in cursor:
                 docs_read += 1
                 transformed_doc = transform_document_placeholder(doc)
-                batch.append(
-                    UpdateOne(
-                        {"_id": transformed_doc["_id"]},
-                        {"$set": transformed_doc},
-                        upsert=True,
-                    )
-                )
+                batch.append(transformed_doc)
 
                 if len(batch) >= job_config["dest_batch_size"]:
-                    dest_coll.bulk_write(batch, ordered=False)
+                    _merge_write_stats(
+                        write_stats,
+                        write_dest_batch(dest_coll, batch, job_config),
+                    )
                     batch = []
 
             if batch:
-                dest_coll.bulk_write(batch, ordered=False)
+                _merge_write_stats(
+                    write_stats,
+                    write_dest_batch(dest_coll, batch, job_config),
+                )
 
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
@@ -531,6 +711,14 @@ def direct_stream_worker(worker_id: str, job_config: dict):
                         "status": "LOADED",
                         "docs_written": docs_read,
                         "stream_duration": time.time() - start_time,
+                        "dest_write_mode": _get_dest_write_mode(job_config),
+                        "docs_inserted": write_stats.get("docs_inserted", 0),
+                        "docs_matched": write_stats.get("docs_matched", 0),
+                        "docs_modified": write_stats.get("docs_modified", 0),
+                        "docs_upserted": write_stats.get("docs_upserted", 0),
+                        "docs_upserted_after_duplicate": write_stats.get("docs_upserted_after_duplicate", 0),
+                        "duplicate_key_errors": write_stats.get("duplicate_key_errors", 0),
+                        "batches_written": write_stats.get("batches_written", 0),
                     }
                 },
             )
@@ -566,6 +754,7 @@ def mongodump_worker(worker_id: str, job_config: dict):
             "DUMPING",
             worker_id,
             job_config["max_retries"],
+            job_config.get("lease_hours", 1),
         )
         if not chunk:
             time.sleep(5)
@@ -657,6 +846,7 @@ def bson_load_worker(worker_id: str, job_config: dict):
             "LOADING",
             worker_id,
             job_config["max_retries"],
+            job_config.get("lease_hours", 1),
         )
         if not chunk:
             time.sleep(5)
@@ -677,31 +867,46 @@ def bson_load_worker(worker_id: str, job_config: dict):
             batch = []
             docs_written = 0
 
+            write_stats = _empty_write_stats()
+
             if bson_file and os.path.exists(bson_file):
                 # Stream BSON file iteratively (Crucial for memory safety)
                 with open(bson_file, "rb") as f:
                     for doc in bson.decode_file_iter(f):
                         docs_written += 1
                         transformed_doc = transform_document_placeholder(doc)
-                        batch.append(
-                            UpdateOne(
-                                {"_id": transformed_doc["_id"]},
-                                {"$set": transformed_doc},
-                                upsert=True,
-                            )
-                        )
+                        batch.append(transformed_doc)
 
                         if len(batch) >= job_config["dest_batch_size"]:
-                            dest_coll.bulk_write(batch, ordered=False)
+                            _merge_write_stats(
+                                write_stats,
+                                write_dest_batch(dest_coll, batch, job_config),
+                            )
                             batch = []
 
                 if batch:
-                    dest_coll.bulk_write(batch, ordered=False)
+                    _merge_write_stats(
+                        write_stats,
+                        write_dest_batch(dest_coll, batch, job_config),
+                    )
 
             # Transition to loaded, then trigger cleanup immediately
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
-                {"$set": {"status": "LOADED", "docs_written": docs_written}},
+                {
+                    "$set": {
+                        "status": "LOADED",
+                        "docs_written": docs_written,
+                        "dest_write_mode": _get_dest_write_mode(job_config),
+                        "docs_inserted": write_stats.get("docs_inserted", 0),
+                        "docs_matched": write_stats.get("docs_matched", 0),
+                        "docs_modified": write_stats.get("docs_modified", 0),
+                        "docs_upserted": write_stats.get("docs_upserted", 0),
+                        "docs_upserted_after_duplicate": write_stats.get("docs_upserted_after_duplicate", 0),
+                        "duplicate_key_errors": write_stats.get("duplicate_key_errors", 0),
+                        "batches_written": write_stats.get("batches_written", 0),
+                    }
+                },
             )
 
             if chunk.get("dump_folder") and os.path.exists(chunk["dump_folder"]):
@@ -776,6 +981,13 @@ def run_benchmark(config_file_path: str):
                 "total_docs": {"$sum": "$docs_written"},
                 "total_dump_bytes": {"$sum": {"$ifNull": ["$dump_bytes", 0]}},
                 "completed_chunks": {"$sum": 1},
+                "total_docs_inserted": {"$sum": {"$ifNull": ["$docs_inserted", 0]}},
+                "total_docs_matched": {"$sum": {"$ifNull": ["$docs_matched", 0]}},
+                "total_docs_modified": {"$sum": {"$ifNull": ["$docs_modified", 0]}},
+                "total_docs_upserted": {"$sum": {"$ifNull": ["$docs_upserted", 0]}},
+                "total_docs_upserted_after_duplicate": {"$sum": {"$ifNull": ["$docs_upserted_after_duplicate", 0]}},
+                "total_duplicate_key_errors": {"$sum": {"$ifNull": ["$duplicate_key_errors", 0]}},
+                "total_batches_written": {"$sum": {"$ifNull": ["$batches_written", 0]}},
             }
         },
     ]
@@ -784,7 +996,18 @@ def run_benchmark(config_file_path: str):
     metrics = (
         stats[0]
         if stats
-        else {"total_docs": 0, "total_dump_bytes": 0, "completed_chunks": 0}
+        else {
+            "total_docs": 0,
+            "total_dump_bytes": 0,
+            "completed_chunks": 0,
+            "total_docs_inserted": 0,
+            "total_docs_matched": 0,
+            "total_docs_modified": 0,
+            "total_docs_upserted": 0,
+            "total_docs_upserted_after_duplicate": 0,
+            "total_duplicate_key_errors": 0,
+            "total_batches_written": 0,
+        }
     )
 
     docs_per_sec = (
@@ -802,6 +1025,14 @@ def run_benchmark(config_file_path: str):
         "total_docs_written": metrics["total_docs"],
         "total_dump_bytes": metrics["total_dump_bytes"],
         "completed_chunks": metrics["completed_chunks"],
+        "total_docs_inserted": metrics.get("total_docs_inserted", 0),
+        "total_docs_matched": metrics.get("total_docs_matched", 0),
+        "total_docs_modified": metrics.get("total_docs_modified", 0),
+        "total_docs_upserted": metrics.get("total_docs_upserted", 0),
+        "total_docs_upserted_after_duplicate": metrics.get("total_docs_upserted_after_duplicate", 0),
+        "total_duplicate_key_errors": metrics.get("total_duplicate_key_errors", 0),
+        "total_batches_written": metrics.get("total_batches_written", 0),
+        "dest_write_mode": _get_dest_write_mode(job_config),
         "effective_docs_per_second": round(docs_per_sec, 2),
         "effective_mb_per_second": round(mb_per_sec, 2),
         "finished_at": datetime.now(timezone.utc),
