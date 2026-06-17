@@ -1,7 +1,7 @@
 {
     "job_id": "<YOUR_JOB_ID>",
     "mode": "MONGODUMP_STAGE | DIRECT_STREAM",
-    "source_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<SOURCE_CLUSTER_URL>/",
+    "source_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<SOURCE_CLUSTER_URL>/?readPreference=secondaryPreferred&maxStalenessSeconds=120",
     "dest_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<DESTINATION_CLUSTER_URL>/",
     "bookkeeping_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<BOOKKEEPING_CLUSTER_URL>/",
     "source_db": "<SOURCE_DATABASE_NAME>",
@@ -9,6 +9,7 @@
     "dest_db": "<DESTINATION_DATABASE_NAME>",
     "dest_collection": "<DESTINATION_COLLECTION_NAME>",
     "dest_write_mode": "INSERT_THEN_UPSERT_ON_DUP | UPSERT",
+    "drop_destination_collection_before_load": false,
     "staging_root": "<PATH_TO_STAGING_DIRECTORY>",
     "chunk_window_hours": 1,
     "max_docs_per_chunk": 10000,

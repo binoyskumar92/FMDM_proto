@@ -164,3 +164,6 @@ scp -i ~/.ssh/bsk-test.pem \
   config.json \
   ec2-user@ec2-34-207-98-172.compute-1.amazonaws.com:/home/ec2-user/
 sudo yum install -y tmux
+
+python3 -c "import secrets; print(secrets.token_hex(32))"
+export FMDM_HASH_SALT="33a0f9ffa27b505ef7c2d2d44f2d5b0d49af41eb22e40562a8a60e59d05974cb"

@@ -1,7 +1,6 @@
 import argparse
 import json
 import logging
-import math
 import os
 import shutil
 import subprocess
@@ -10,10 +9,13 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ProcessPoolExecutor
 
 import bson
+import concurrent.futures
 import pymongo
 from pymongo import UpdateOne, MongoClient
-from pymongo.errors import BulkWriteError
+from pymongo.errors import BulkWriteError, OperationFailure
 from bson.objectid import ObjectId
+import hmac
+import hashlib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,12 +26,87 @@ logging.basicConfig(
 # ==========================================
 # MODULE 1: PLUGGABLE TRANSFORM ENGINE
 # ==========================================
-def transform_document_placeholder(doc: dict) -> dict:
-    """
-    FUTURE MASKING ENGINE INJECTION POINT.
-    Currently a no-op to establish baseline benchmark.
-    """
-    return doc
+def _mask_hash(value, salt: bytes):
+    """HMAC-SHA256 hash masking preserving digits, letters, and symbols."""
+    if value is None:
+        return None
+    s = str(value)
+    if not s:
+        return s
+
+    # 1. Create the cryptographic hash
+    digest = hmac.new(salt, s.encode("utf-8"), hashlib.sha256).digest()
+
+    # Stretch the digest if the input is longer than 32 chars
+    while len(digest) < len(s):
+        digest += hmac.new(salt, digest, hashlib.sha256).digest()
+
+    out_chars = []
+
+    # 2. Universal Shape-Preserving Loop
+    for i, ch in enumerate(s):
+        if ch.isdigit():
+            # Replace digits with pseudo-random digits (0-9)
+            out_chars.append(str(digest[i] % 10))
+
+        elif ch.isalpha():
+            # Replace letters with pseudo-random letters (A-Z or a-z)
+            # The modulo 26 ensures it stays within the alphabet
+            shift = digest[i] % 26
+            if ch.isupper():
+                out_chars.append(chr(ord("A") + shift))
+            else:
+                out_chars.append(chr(ord("a") + shift))
+
+        else:
+            # Preserve all symbols: dashes, spaces, @, periods, etc.
+            out_chars.append(ch)
+
+    return "".join(out_chars)
+
+
+def _apply_mask_recursive(doc_part, keys, technique, salt):
+    """Recursively traverse and mask fields. Natively handles nested arrays."""
+    # Base case: We reached the target field
+    if not keys:
+        if technique.lower() == "hash":
+            return _mask_hash(doc_part, salt)
+        return doc_part  # Fallback if technique isn't recognized
+
+    current_key = keys[0]
+    remaining_keys = keys[1:]
+
+    # Traverse dictionaries
+    if isinstance(doc_part, dict):
+        if current_key in doc_part:
+            new_doc = dict(doc_part)  # Shallow copy to avoid mutating original
+            new_doc[current_key] = _apply_mask_recursive(
+                doc_part[current_key], remaining_keys, technique, salt
+            )
+            return new_doc
+        return doc_part
+
+    # Traverse arrays (apply the rule to EVERY item in the list)
+    elif isinstance(doc_part, list):
+        return [_apply_mask_recursive(item, keys, technique, salt) for item in doc_part]
+
+    # If it's a scalar but we still have keys, the path is invalid for this doc
+    return doc_part
+
+
+def transform_document(doc: dict, rules: list, salt: bytes) -> dict:
+    """Applies all masking rules to a single document."""
+    if not rules:
+        return doc
+
+    masked = doc
+    for rule in rules:
+        # Note: Your orchestrator should parse the dot-notation path into a list
+        # of keys beforehand (e.g., "data.ssn" -> ["data", "ssn"])
+        masked = _apply_mask_recursive(
+            masked, rule["field_keys"], rule["technique"], salt
+        )
+    return masked
 
 
 # ==========================================
@@ -48,6 +125,25 @@ def initialize_bookkeeping(db_uri: str, job_config: dict):
     # Initialize or resume Job record
     job = db.jobs.find_one({"job_id": job_config["job_id"]})
     if not job:
+        src_client = MongoClient(job_config["source_uri"])
+        dest_client = MongoClient(job_config["dest_uri"])
+        src_coll = src_client[job_config["source_db"]][job_config["source_collection"]]
+        dest_coll = dest_client[job_config["dest_db"]][job_config["dest_collection"]]
+
+        is_clean_slate = job_config.get(
+            "drop_destination_collection_before_load", False
+        )
+
+        if is_clean_slate:
+            logging.warning(
+                f"CLEAN SLATE: Dropping destination collection {job_config['dest_collection']}..."
+            )
+            dest_coll.drop()
+
+        sync_collection_indexes(src_coll, dest_coll, is_clean_slate)
+
+        src_client.close()
+        dest_client.close()
         db.jobs.insert_one(
             {
                 "job_id": job_config["job_id"],
@@ -355,7 +451,7 @@ def get_optimal_upper_bound(
 
 def plan_chunks(job_config):
     """Generates sequential, density-aware chunk boundaries with timer."""
-    bk_client = MongoClient(job_config['bookkeeping_uri'])
+    bk_client = MongoClient(job_config["bookkeeping_uri"])
     db = bk_client["masking_control"]
 
     # If chunks already exist, skip planning (Resume mode)
@@ -363,17 +459,21 @@ def plan_chunks(job_config):
         logging.info("Chunks already exist. Skipping planning phase.")
         return
 
-    db.jobs.update_one({"job_id": job_config["job_id"]}, {"$set": {"status": "PLANNING"}})
+    db.jobs.update_one(
+        {"job_id": job_config["job_id"]}, {"$set": {"status": "PLANNING"}}
+    )
 
-    src_client = MongoClient(job_config['source_uri'])
-    coll = src_client[job_config['source_db']][job_config['source_collection']]
+    src_client = MongoClient(job_config["source_uri"])
+    coll = src_client[job_config["source_db"]][job_config["source_collection"]]
 
     min_doc = list(coll.find({}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
     max_doc = list(coll.find({}, {"_id": 1}).sort("_id", -1).limit(1).hint("_id_"))
 
     if not min_doc or not max_doc:
         logging.info("Source collection is empty.")
-        db.jobs.update_one({"job_id": job_config["job_id"]}, {"$set": {"status": "COMPLETED"}})
+        db.jobs.update_one(
+            {"job_id": job_config["job_id"]}, {"$set": {"status": "COMPLETED"}}
+        )
         return
 
     global_min_id = min_doc[0]["_id"]
@@ -385,7 +485,7 @@ def plan_chunks(job_config):
     chunks_to_insert = []
 
     logging.info("Starting bi-directional density-aware chunk planning...")
-    planning_start_time = time.time() # START CLOCK
+    planning_start_time = time.time()  # START CLOCK
 
     while current_lower_bound < global_max_id:
 
@@ -409,7 +509,9 @@ def plan_chunks(job_config):
         # loop forever. This keeps the half-open range invariant intact:
         # [current_lower_bound, safe_upper_bound)
         if safe_upper_bound <= current_lower_bound:
-            next_real_doc_id = _next_real_doc_id(coll, current_lower_bound, inclusive=False)
+            next_real_doc_id = _next_real_doc_id(
+                coll, current_lower_bound, inclusive=False
+            )
             if not next_real_doc_id:
                 break
             safe_upper_bound = next_real_doc_id
@@ -420,20 +522,22 @@ def plan_chunks(job_config):
                 cap=job_config["max_docs_per_chunk"],
             )
 
-        chunks_to_insert.append({
-            "chunk_id": f"{job_config['job_id']}_{seq}",
-            "job_id": job_config["job_id"],
-            "chunk_sequence": seq,
-            "lower_bound": current_lower_bound,
-            "upper_bound": safe_upper_bound,
-            # Keep old field for backward compatibility with existing tests and
-            # metrics, even though it is a document count, not bytes.
-            "bytes_read_estimate": estimated_count,
-            # New correctly named alias for future code.
-            "docs_read_estimate": estimated_count,
-            "status": ready_status,
-            "attempts": 0
-        })
+        chunks_to_insert.append(
+            {
+                "chunk_id": f"{job_config['job_id']}_{seq}",
+                "job_id": job_config["job_id"],
+                "chunk_sequence": seq,
+                "lower_bound": current_lower_bound,
+                "upper_bound": safe_upper_bound,
+                # Keep old field for backward compatibility with existing tests and
+                # metrics, even though it is a document count, not bytes.
+                "bytes_read_estimate": estimated_count,
+                # New correctly named alias for future code.
+                "docs_read_estimate": estimated_count,
+                "status": ready_status,
+                "attempts": 0,
+            }
+        )
 
         current_lower_bound = safe_upper_bound
         seq += 1
@@ -451,15 +555,17 @@ def plan_chunks(job_config):
 
     db.jobs.update_one(
         {"job_id": job_config["job_id"]},
-        {"$set": {
-            "status": "RUNNING",
-            "total_chunks": seq - 1,
-            "planning_duration_seconds": round(planning_duration, 2)
-        }}
+        {
+            "$set": {
+                "status": "RUNNING",
+                "total_chunks": seq - 1,
+                "planning_duration_seconds": round(planning_duration, 2),
+            }
+        },
     )
-    logging.info(f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks.")
-
-
+    logging.info(
+        f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks."
+    )
 
 
 # ==========================================
@@ -585,8 +691,7 @@ def write_dest_batch(dest_coll, docs: list, job_config: dict) -> dict:
         write_errors = details.get("writeErrors", [])
 
         non_duplicate_errors = [
-            err for err in write_errors
-            if not _is_duplicate_key_error(err)
+            err for err in write_errors if not _is_duplicate_key_error(err)
         ]
         if non_duplicate_errors:
             raise
@@ -599,11 +704,7 @@ def write_dest_batch(dest_coll, docs: list, job_config: dict) -> dict:
             }
         )
 
-        duplicate_docs = [
-            docs[i]
-            for i in duplicate_indexes
-            if 0 <= i < len(docs)
-        ]
+        duplicate_docs = [docs[i] for i in duplicate_indexes if 0 <= i < len(docs)]
 
         stats = {
             "docs_seen": len(docs),
@@ -688,7 +789,11 @@ def direct_stream_worker(worker_id: str, job_config: dict):
 
             for doc in cursor:
                 docs_read += 1
-                transformed_doc = transform_document_placeholder(doc)
+                transformed_doc = transform_document(
+                    doc,
+                    job_config.get("masking_rules", []),
+                    job_config["hash_salt_bytes"],
+                )
                 batch.append(transformed_doc)
 
                 if len(batch) >= job_config["dest_batch_size"]:
@@ -716,8 +821,12 @@ def direct_stream_worker(worker_id: str, job_config: dict):
                         "docs_matched": write_stats.get("docs_matched", 0),
                         "docs_modified": write_stats.get("docs_modified", 0),
                         "docs_upserted": write_stats.get("docs_upserted", 0),
-                        "docs_upserted_after_duplicate": write_stats.get("docs_upserted_after_duplicate", 0),
-                        "duplicate_key_errors": write_stats.get("duplicate_key_errors", 0),
+                        "docs_upserted_after_duplicate": write_stats.get(
+                            "docs_upserted_after_duplicate", 0
+                        ),
+                        "duplicate_key_errors": write_stats.get(
+                            "duplicate_key_errors", 0
+                        ),
                         "batches_written": write_stats.get("batches_written", 0),
                     }
                 },
@@ -866,7 +975,6 @@ def bson_load_worker(worker_id: str, job_config: dict):
             bson_file = chunk.get("bson_file_path")
             batch = []
             docs_written = 0
-
             write_stats = _empty_write_stats()
 
             if bson_file and os.path.exists(bson_file):
@@ -874,7 +982,11 @@ def bson_load_worker(worker_id: str, job_config: dict):
                 with open(bson_file, "rb") as f:
                     for doc in bson.decode_file_iter(f):
                         docs_written += 1
-                        transformed_doc = transform_document_placeholder(doc)
+                        transformed_doc = transform_document(
+                            doc,
+                            job_config.get("masking_rules", []),
+                            job_config["hash_salt_bytes"],
+                        )
                         batch.append(transformed_doc)
 
                         if len(batch) >= job_config["dest_batch_size"]:
@@ -902,8 +1014,12 @@ def bson_load_worker(worker_id: str, job_config: dict):
                         "docs_matched": write_stats.get("docs_matched", 0),
                         "docs_modified": write_stats.get("docs_modified", 0),
                         "docs_upserted": write_stats.get("docs_upserted", 0),
-                        "docs_upserted_after_duplicate": write_stats.get("docs_upserted_after_duplicate", 0),
-                        "duplicate_key_errors": write_stats.get("duplicate_key_errors", 0),
+                        "docs_upserted_after_duplicate": write_stats.get(
+                            "docs_upserted_after_duplicate", 0
+                        ),
+                        "duplicate_key_errors": write_stats.get(
+                            "duplicate_key_errors", 0
+                        ),
                         "batches_written": write_stats.get("batches_written", 0),
                     }
                 },
@@ -938,6 +1054,24 @@ def bson_load_worker(worker_id: str, job_config: dict):
 def run_benchmark(config_file_path: str):
     with open(config_file_path, "r") as f:
         job_config = json.load(f)
+    # 1. Enforce the security salt requirement immediately
+    hash_salt_str = os.getenv("FMDM_HASH_SALT")
+    if not hash_salt_str:
+        raise ValueError(
+            "CRITICAL SECURITY ERROR: FMDM_HASH_SALT environment variable is not set!"
+        )
+
+    # 2. Inject it safely into memory for the workers to use
+    job_config["hash_salt_bytes"] = hash_salt_str.encode("utf-8")
+
+    # 3. Pre-compute the traversal keys for the workers!
+    masking_rules = job_config.get("masking_rules", [])
+    for rule in masking_rules:
+        # Converts "a.b.c.SSN" -> ['a', 'b', 'c', 'SSN']
+        rule["field_keys"] = rule["field_path"].split(".")
+
+        # We know from your Collibra mapping that SSN/ACCOUNT_NUMBER use "hash"
+        rule["technique"] = "hash"
 
     logging.info(
         f"Starting ETL Benchmark Job: {job_config['job_id']} in mode: {job_config['mode']}"
@@ -951,17 +1085,40 @@ def run_benchmark(config_file_path: str):
     if job_config["mode"] == "DIRECT_STREAM":
         workers = job_config["stream_workers"]
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            for i in range(workers):
+            futures = [
                 executor.submit(direct_stream_worker, f"stream_{i}", job_config)
+                for i in range(workers)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.critical(f"FATAL WORKER CRASH: {e}")
 
     elif job_config["mode"] == "MONGODUMP_STAGE":
         dump_workers = job_config["dump_workers"]
         load_workers = job_config["load_workers"]
         with ProcessPoolExecutor(max_workers=(dump_workers + load_workers)) as executor:
+            futures = []
+
+            # 1. Submit and collect dump workers
             for i in range(dump_workers):
-                executor.submit(mongodump_worker, f"dump_{i}", job_config)
+                futures.append(
+                    executor.submit(mongodump_worker, f"dump_{i}", job_config)
+                )
+
+            # 2. Submit and collect load workers
             for i in range(load_workers):
-                executor.submit(bson_load_worker, f"load_{i}", job_config)
+                futures.append(
+                    executor.submit(bson_load_worker, f"load_{i}", job_config)
+                )
+
+            # 3. Safely catch crashes across ALL workers in this stage
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.critical(f"FATAL WORKER CRASH: {e}")
 
     overall_duration = time.time() - overall_start
 
@@ -985,8 +1142,12 @@ def run_benchmark(config_file_path: str):
                 "total_docs_matched": {"$sum": {"$ifNull": ["$docs_matched", 0]}},
                 "total_docs_modified": {"$sum": {"$ifNull": ["$docs_modified", 0]}},
                 "total_docs_upserted": {"$sum": {"$ifNull": ["$docs_upserted", 0]}},
-                "total_docs_upserted_after_duplicate": {"$sum": {"$ifNull": ["$docs_upserted_after_duplicate", 0]}},
-                "total_duplicate_key_errors": {"$sum": {"$ifNull": ["$duplicate_key_errors", 0]}},
+                "total_docs_upserted_after_duplicate": {
+                    "$sum": {"$ifNull": ["$docs_upserted_after_duplicate", 0]}
+                },
+                "total_duplicate_key_errors": {
+                    "$sum": {"$ifNull": ["$duplicate_key_errors", 0]}
+                },
                 "total_batches_written": {"$sum": {"$ifNull": ["$batches_written", 0]}},
             }
         },
@@ -1029,7 +1190,9 @@ def run_benchmark(config_file_path: str):
         "total_docs_matched": metrics.get("total_docs_matched", 0),
         "total_docs_modified": metrics.get("total_docs_modified", 0),
         "total_docs_upserted": metrics.get("total_docs_upserted", 0),
-        "total_docs_upserted_after_duplicate": metrics.get("total_docs_upserted_after_duplicate", 0),
+        "total_docs_upserted_after_duplicate": metrics.get(
+            "total_docs_upserted_after_duplicate", 0
+        ),
         "total_duplicate_key_errors": metrics.get("total_duplicate_key_errors", 0),
         "total_batches_written": metrics.get("total_batches_written", 0),
         "dest_write_mode": _get_dest_write_mode(job_config),
@@ -1046,6 +1209,75 @@ def run_benchmark(config_file_path: str):
     for k, v in summary.items():
         logging.info(f"{k}: {v}")
     logging.info("=========================================")
+
+
+# ==========================================
+# INDEX SYNC
+# ==========================================
+
+
+def sync_collection_indexes(src_coll, dest_coll, is_clean_slate: bool):
+    """
+    Syncs indexes from source to destination.
+    Executes ONLY if the destination was just dropped, or if it has no custom indexes.
+    """
+    # 1. Check if we should skip index creation
+    if not is_clean_slate:
+        try:
+            dest_indexes = list(dest_coll.list_indexes())
+            # If there is more than just the default '_id_' index, skip sync entirely.
+            if len(dest_indexes) > 1:
+                logging.info(
+                    "Destination collection already has indexes. Skipping index sync."
+                )
+                return
+        except OperationFailure as e:
+            # Error Code 26 is NamespaceNotFound (collection doesn't exist yet)
+            # This is safe to ignore; it just means there are no indexes.
+            if e.code == 26:
+                pass
+            else:
+                raise e
+
+    # 2. Fetch source indexes
+    try:
+        src_indexes = list(src_coll.list_indexes())
+    except OperationFailure as e:
+        if e.code == 26:
+            logging.warning("Source collection does not exist. Skipping index sync.")
+            return
+        raise e
+
+    # 3. Safely copy indexes with conflict resolution
+    indexes_synced = 0
+    for idx_info in src_indexes:
+        idx_name = idx_info["name"]
+        if idx_name == "_id_":
+            continue
+
+        keys = list(idx_info["key"].items())
+        options = {
+            k: v for k, v in idx_info.items() if k not in ["key", "v", "ns", "name"]
+        }
+        index_model = pymongo.IndexModel(keys, name=idx_name, **options)
+
+        try:
+            dest_coll.create_indexes([index_model])
+            indexes_synced += 1
+        except OperationFailure as e:
+            # Error Code 85 is IndexOptionsConflict
+            if e.code == 85:
+                logging.warning(
+                    f"Index conflict detected for '{idx_name}'. Dropping outdated index and recreating..."
+                )
+                dest_coll.drop_index(idx_name)
+                dest_coll.create_indexes([index_model])
+                indexes_synced += 1
+            else:
+                raise e
+
+    if indexes_synced > 0:
+        logging.info(f"Successfully synced {indexes_synced} indexes to destination.")
 
 
 # ==========================================
