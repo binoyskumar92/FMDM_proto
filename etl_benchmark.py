@@ -127,20 +127,26 @@ def initialize_bookkeeping(db_uri: str, job_config: dict):
     if not job:
         src_client = MongoClient(job_config["source_uri"])
         dest_client = MongoClient(job_config["dest_uri"])
-        src_coll = src_client[job_config["source_db"]][job_config["source_collection"]]
-        dest_coll = dest_client[job_config["dest_db"]][job_config["dest_collection"]]
 
-        is_clean_slate = job_config.get(
-            "drop_destination_collection_before_load", False
-        )
+        for coll_config in job_config.get("collections", []):
+            src_coll = src_client[job_config["source_db"]][
+                coll_config["source_collection"]
+            ]
+            dest_coll = dest_client[job_config["dest_db"]][
+                coll_config["dest_collection"]
+            ]
 
-        if is_clean_slate:
-            logging.warning(
-                f"CLEAN SLATE: Dropping destination collection {job_config['dest_collection']}..."
+            is_clean_slate = coll_config.get(
+                "drop_destination_collection_before_load", False
             )
-            dest_coll.drop()
 
-        sync_collection_indexes(src_coll, dest_coll, is_clean_slate)
+            if is_clean_slate:
+                logging.warning(
+                    f"CLEAN SLATE: Dropping destination collection {coll_config['dest_collection']}..."
+                )
+                dest_coll.drop()
+
+            sync_collection_indexes(src_coll, dest_coll, is_clean_slate)
 
         src_client.close()
         dest_client.close()
@@ -450,7 +456,7 @@ def get_optimal_upper_bound(
 
 
 def plan_chunks(job_config):
-    """Generates sequential, density-aware chunk boundaries with timer."""
+    """Generates sequential, density-aware chunk boundaries with timer for all collections."""
     bk_client = MongoClient(job_config["bookkeeping_uri"])
     db = bk_client["masking_control"]
 
@@ -464,88 +470,98 @@ def plan_chunks(job_config):
     )
 
     src_client = MongoClient(job_config["source_uri"])
-    coll = src_client[job_config["source_db"]][job_config["source_collection"]]
-
-    min_doc = list(coll.find({}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
-    max_doc = list(coll.find({}, {"_id": 1}).sort("_id", -1).limit(1).hint("_id_"))
-
-    if not min_doc or not max_doc:
-        logging.info("Source collection is empty.")
-        db.jobs.update_one(
-            {"job_id": job_config["job_id"]}, {"$set": {"status": "COMPLETED"}}
-        )
-        return
-
-    global_min_id = min_doc[0]["_id"]
-    global_max_id = max_doc[0]["_id"]
-
-    current_lower_bound = global_min_id
-    seq = 1
     ready_status = "READY" if job_config["mode"] == "DIRECT_STREAM" else "READY_TO_DUMP"
+
+    global_seq = 1
     chunks_to_insert = []
 
-    logging.info("Starting bi-directional density-aware chunk planning...")
+    logging.info(
+        "Starting bi-directional density-aware chunk planning for all collections..."
+    )
     planning_start_time = time.time()  # START CLOCK
 
-    while current_lower_bound < global_max_id:
+    for coll_config in job_config.get("collections", []):
+        src_coll_name = coll_config["source_collection"]
+        dest_coll_name = coll_config["dest_collection"]
+        coll = src_client[job_config["source_db"]][src_coll_name]
 
-        # Calculate optimal boundary using expand/shrink logic
-        safe_upper_bound, estimated_count = get_optimal_upper_bound(
-            coll,
-            current_lower_bound,
-            job_config["chunk_window_hours"],
-            job_config["max_docs_per_chunk"],
-        )
+        logging.info(f"Planning chunks for collection: {src_coll_name}...")
 
-        # Fast-forward over empty gaps (Gap Compression)
-        if estimated_count == 0:
-            next_real_doc_id = _next_real_doc_id(coll, safe_upper_bound, inclusive=True)
-            if not next_real_doc_id:
-                break
-            current_lower_bound = next_real_doc_id
+        min_doc = list(coll.find({}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
+        max_doc = list(coll.find({}, {"_id": 1}).sort("_id", -1).limit(1).hint("_id_"))
+
+        if not min_doc or not max_doc:
+            logging.info(f"Source collection {src_coll_name} is empty. Skipping.")
             continue
 
-        # Defensive progress guard. Without this, a pathological boundary can
-        # loop forever. This keeps the half-open range invariant intact:
-        # [current_lower_bound, safe_upper_bound)
-        if safe_upper_bound <= current_lower_bound:
-            next_real_doc_id = _next_real_doc_id(
-                coll, current_lower_bound, inclusive=False
-            )
-            if not next_real_doc_id:
-                break
-            safe_upper_bound = next_real_doc_id
-            estimated_count = _count_id_range(
+        global_min_id = min_doc[0]["_id"]
+        global_max_id = max_doc[0]["_id"]
+
+        current_lower_bound = global_min_id
+
+        while current_lower_bound < global_max_id:
+
+            # Calculate optimal boundary using expand/shrink logic
+            safe_upper_bound, estimated_count = get_optimal_upper_bound(
                 coll,
                 current_lower_bound,
-                safe_upper_bound,
-                cap=job_config["max_docs_per_chunk"],
+                job_config["chunk_window_hours"],
+                job_config["max_docs_per_chunk"],
             )
 
-        chunks_to_insert.append(
-            {
-                "chunk_id": f"{job_config['job_id']}_{seq}",
-                "job_id": job_config["job_id"],
-                "chunk_sequence": seq,
-                "lower_bound": current_lower_bound,
-                "upper_bound": safe_upper_bound,
-                # Keep old field for backward compatibility with existing tests and
-                # metrics, even though it is a document count, not bytes.
-                "bytes_read_estimate": estimated_count,
-                # New correctly named alias for future code.
-                "docs_read_estimate": estimated_count,
-                "status": ready_status,
-                "attempts": 0,
-            }
-        )
+            # Fast-forward over empty gaps (Gap Compression)
+            if estimated_count == 0:
+                next_real_doc_id = _next_real_doc_id(
+                    coll, safe_upper_bound, inclusive=True
+                )
+                if not next_real_doc_id:
+                    break
+                current_lower_bound = next_real_doc_id
+                continue
 
-        current_lower_bound = safe_upper_bound
-        seq += 1
+            # Defensive progress guard. Without this, a pathological boundary can
+            # loop forever. This keeps the half-open range invariant intact:
+            # [current_lower_bound, safe_upper_bound)
+            if safe_upper_bound <= current_lower_bound:
+                next_real_doc_id = _next_real_doc_id(
+                    coll, current_lower_bound, inclusive=False
+                )
+                if not next_real_doc_id:
+                    break
+                safe_upper_bound = next_real_doc_id
+                estimated_count = _count_id_range(
+                    coll,
+                    current_lower_bound,
+                    safe_upper_bound,
+                    cap=job_config["max_docs_per_chunk"],
+                )
 
-        # Batch insert to bookkeeping to save memory
-        if len(chunks_to_insert) >= 1000:
-            db.chunks.insert_many(chunks_to_insert)
-            chunks_to_insert = []
+            chunks_to_insert.append(
+                {
+                    "chunk_id": f"{job_config['job_id']}_{src_coll_name}_{global_seq}",
+                    "job_id": job_config["job_id"],
+                    "source_collection": src_coll_name,
+                    "dest_collection": dest_coll_name,
+                    "chunk_sequence": global_seq,
+                    "lower_bound": current_lower_bound,
+                    "upper_bound": safe_upper_bound,
+                    # Keep old field for backward compatibility with existing tests and
+                    # metrics, even though it is a document count, not bytes.
+                    "bytes_read_estimate": estimated_count,
+                    # New correctly named alias for future code.
+                    "docs_read_estimate": estimated_count,
+                    "status": ready_status,
+                    "attempts": 0,
+                }
+            )
+
+            current_lower_bound = safe_upper_bound
+            global_seq += 1
+
+            # Batch insert to bookkeeping to save memory
+            if len(chunks_to_insert) >= 1000:
+                db.chunks.insert_many(chunks_to_insert)
+                chunks_to_insert = []
 
     # STOP CLOCK
     planning_duration = time.time() - planning_start_time
@@ -558,13 +574,13 @@ def plan_chunks(job_config):
         {
             "$set": {
                 "status": "RUNNING",
-                "total_chunks": seq - 1,
+                "total_chunks": global_seq - 1,
                 "planning_duration_seconds": round(planning_duration, 2),
             }
         },
     )
     logging.info(
-        f"Planning complete in {round(planning_duration, 2)} seconds. Created {seq - 1} chunks."
+        f"Multi-collection planning complete in {round(planning_duration, 2)} seconds. Created {global_seq - 1} chunks."
     )
 
 
@@ -745,8 +761,6 @@ def direct_stream_worker(worker_id: str, job_config: dict):
     dest_client = MongoClient(job_config["dest_uri"])
     bk_client = MongoClient(job_config["bookkeeping_uri"])
 
-    src_coll = src_client[job_config["source_db"]][job_config["source_collection"]]
-    dest_coll = dest_client[job_config["dest_db"]][job_config["dest_collection"]]
     chunks_coll = bk_client["masking_control"]["chunks"]
 
     while True:
@@ -776,6 +790,15 @@ def direct_stream_worker(worker_id: str, job_config: dict):
 
         try:
             start_time = time.time()
+
+            # Dynamic routing!
+            src_coll_name = chunk["source_collection"]
+            dest_coll_name = chunk["dest_collection"]
+            src_coll = src_client[job_config["source_db"]][src_coll_name]
+            dest_coll = dest_client[job_config["dest_db"]][dest_coll_name]
+
+            chunk_rules = job_config["_rules_map"].get(src_coll_name, [])
+
             query = {"_id": {"$gte": chunk["lower_bound"], "$lt": chunk["upper_bound"]}}
             cursor = (
                 src_coll.find(query)
@@ -791,7 +814,7 @@ def direct_stream_worker(worker_id: str, job_config: dict):
                 docs_read += 1
                 transformed_doc = transform_document(
                     doc,
-                    job_config.get("masking_rules", []),
+                    chunk_rules,
                     job_config["hash_salt_bytes"],
                 )
                 batch.append(transformed_doc)
@@ -884,6 +907,7 @@ def mongodump_worker(worker_id: str, job_config: dict):
             chunk_dir = os.path.join(
                 job_config["staging_root"], job_config["job_id"], chunk["chunk_id"]
             )
+            src_coll_name = chunk["source_collection"]
 
             # Clean partial leftovers if retrying
             if os.path.exists(chunk_dir):
@@ -899,7 +923,7 @@ def mongodump_worker(worker_id: str, job_config: dict):
                 "--db",
                 job_config["source_db"],
                 "--collection",
-                job_config["source_collection"],
+                src_coll_name,
                 "--query",
                 query_str,
                 "--out",
@@ -912,9 +936,7 @@ def mongodump_worker(worker_id: str, job_config: dict):
 
             # Locate BSON
             dumped_db_dir = os.path.join(chunk_dir, job_config["source_db"])
-            bson_file = os.path.join(
-                dumped_db_dir, f"{job_config['source_collection']}.bson"
-            )
+            bson_file = os.path.join(dumped_db_dir, f"{src_coll_name}.bson")
 
             dump_bytes = os.path.getsize(bson_file) if os.path.exists(bson_file) else 0
 
@@ -943,7 +965,6 @@ def mongodump_worker(worker_id: str, job_config: dict):
 
 def bson_load_worker(worker_id: str, job_config: dict):
     dest_client = MongoClient(job_config["dest_uri"])
-    dest_coll = dest_client[job_config["dest_db"]][job_config["dest_collection"]]
     bk_client = MongoClient(job_config["bookkeeping_uri"])
     chunks_coll = bk_client["masking_control"]["chunks"]
 
@@ -972,6 +993,12 @@ def bson_load_worker(worker_id: str, job_config: dict):
 
         try:
             start_time = time.time()
+
+            src_coll_name = chunk["source_collection"]
+            dest_coll_name = chunk["dest_collection"]
+            dest_coll = dest_client[job_config["dest_db"]][dest_coll_name]
+            chunk_rules = job_config["_rules_map"].get(src_coll_name, [])
+
             bson_file = chunk.get("bson_file_path")
             batch = []
             docs_written = 0
@@ -984,7 +1011,7 @@ def bson_load_worker(worker_id: str, job_config: dict):
                         docs_written += 1
                         transformed_doc = transform_document(
                             doc,
-                            job_config.get("masking_rules", []),
+                            chunk_rules,
                             job_config["hash_salt_bytes"],
                         )
                         batch.append(transformed_doc)
@@ -1064,14 +1091,19 @@ def run_benchmark(config_file_path: str):
     # 2. Inject it safely into memory for the workers to use
     job_config["hash_salt_bytes"] = hash_salt_str.encode("utf-8")
 
-    # 3. Pre-compute the traversal keys for the workers!
-    masking_rules = job_config.get("masking_rules", [])
-    for rule in masking_rules:
-        # Converts "a.b.c.SSN" -> ['a', 'b', 'c', 'SSN']
-        rule["field_keys"] = rule["field_path"].split(".")
+    # 3. Pre-compute the masking rules into a fast lookup dictionary for workers
+    rules_map = {}
+    for coll_config in job_config.get("collections", []):
+        parsed_rules = []
+        for field_path in coll_config.get("masking_fields", []):
+            # Converts "a.b.c.SSN" -> ['a', 'b', 'c', 'SSN']
+            parsed_rules.append(
+                {"field_keys": field_path.split("."), "technique": "hash"}
+            )
+        rules_map[coll_config["source_collection"]] = parsed_rules
 
-        # We know from your Collibra mapping that SSN/ACCOUNT_NUMBER use "hash"
-        rule["technique"] = "hash"
+    # Inject into memory for workers
+    job_config["_rules_map"] = rules_map
 
     logging.info(
         f"Starting ETL Benchmark Job: {job_config['job_id']} in mode: {job_config['mode']}"

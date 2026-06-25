@@ -156,13 +156,14 @@ Upon completion, the script will output a benchmark summary to the console and s
 
 Inside `etl_benchmark.py`, there is a function named `transform_document_placeholder(doc: dict) -> dict`. For the purposes of this benchmark, it returns the document unchanged. In the future, the masking and tokenization engine will be injected directly into this function.
 
-Install Pip: sudo python3 -m ensurepip --default-pip
+Install Pip: 
+sudo python3 -m ensurepip --default-pip
 pip install pymongo
 scp -i ~/.ssh/bsk-test.pem \
   etl_benchmark.py \
   test_chunker.py \
   config.json \
-  ec2-user@ec2-34-207-98-172.compute-1.amazonaws.com:/home/ec2-user/
+  ec2-user@ec2-3-81-234-182.compute-1.amazonaws.com:/home/ec2-user/
 sudo yum install -y tmux
 
 python3 -c "import secrets; print(secrets.token_hex(32))"

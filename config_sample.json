@@ -5,11 +5,8 @@
     "dest_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<DESTINATION_CLUSTER_URL>/",
     "bookkeeping_uri": "mongodb+srv://<USERNAME>:<PASSWORD>@<BOOKKEEPING_CLUSTER_URL>/",
     "source_db": "<SOURCE_DATABASE_NAME>",
-    "source_collection": "<SOURCE_COLLECTION_NAME>",
     "dest_db": "<DESTINATION_DATABASE_NAME>",
-    "dest_collection": "<DESTINATION_COLLECTION_NAME>",
     "dest_write_mode": "INSERT_THEN_UPSERT_ON_DUP | UPSERT",
-    "drop_destination_collection_before_load": false,
     "staging_root": "<PATH_TO_STAGING_DIRECTORY>",
     "chunk_window_hours": 1,
     "max_docs_per_chunk": 10000,
@@ -20,5 +17,32 @@
     "dump_workers": 4,
     "load_workers": 4,
     "max_backlog_chunks": 10,
-    "lease_hours": "<OPTIONAL>Set it longer than your worst expected chunk runtime. If your chunks are small and finish in minutes set it to 1hr"
+    "lease_hours": 1,
+    "collections": [
+        {
+            "source_collection": "<SOURCE_COLLECTION_NAME_1>",
+            "dest_collection": "<DESTINATION_COLLECTION_NAME_1>",
+            "drop_destination_collection_before_load": false,
+            "masking_fields": [
+                "ssn",
+                "account.account_number",
+                "demographics.date_of_birth"
+            ]
+        },
+        {
+            "source_collection": "<SOURCE_COLLECTION_NAME_2>",
+            "dest_collection": "<DESTINATION_COLLECTION_NAME_2>",
+            "drop_destination_collection_before_load": true,
+            "masking_fields": [
+                "email_address",
+                "last_name"
+            ]
+        },
+        {
+            "source_collection": "<SOURCE_COLLECTION_NAME_3>",
+            "dest_collection": "<DESTINATION_COLLECTION_NAME_3>",
+            "drop_destination_collection_before_load": false,
+            "masking_fields": []
+        }
+    ]
 }
