@@ -793,6 +793,32 @@ def write_dest_batch(dest_coll, docs: list, job_config: dict) -> dict:
 # ==========================================
 # MODULE 4: WORKER IMPLEMENTATIONS
 # ==========================================
+def _field_path_exists(node, keys: list) -> bool:
+    """
+    Recursively checks whether a dot-notation field path exists in a document,
+    including through nested arrays — matching the traversal logic in _apply_mask_recursive.
+    """
+    if not keys:
+        return node is not None
+    key = keys[0]
+    rest = keys[1:]
+    if isinstance(node, dict):
+        return key in node and _field_path_exists(node[key], rest)
+    if isinstance(node, list):
+        return any(_field_path_exists(item, [key] + rest) for item in node)
+    return False
+
+
+def _count_masked_fields(doc: dict, rules: list) -> dict:
+    """Returns {dot.path: 1} for each rule whose field is present in the doc."""
+    counts = {}
+    for rule in rules:
+        if _field_path_exists(doc, rule["field_keys"]):
+            path = ".".join(rule["field_keys"])
+            counts[path] = counts.get(path, 0) + 1
+    return counts
+
+
 def direct_stream_worker(worker_id: str, job_config: dict):
     src_client = MongoClient(job_config["source_uri"])
     dest_client = MongoClient(job_config["dest_uri"])
@@ -846,9 +872,12 @@ def direct_stream_worker(worker_id: str, job_config: dict):
             batch = []
             docs_read = 0
             write_stats = _empty_write_stats()
+            field_mask_counts = {}
 
             for doc in cursor:
                 docs_read += 1
+                for path, cnt in _count_masked_fields(doc, chunk_rules).items():
+                    field_mask_counts[path] = field_mask_counts.get(path, 0) + cnt
                 transformed_doc = transform_document(
                     doc,
                     chunk_rules,
@@ -875,6 +904,7 @@ def direct_stream_worker(worker_id: str, job_config: dict):
                     "$set": {
                         "status": "LOADED",
                         "docs_written": docs_read,
+                        "field_mask_counts": field_mask_counts,
                         "stream_duration": time.time() - start_time,
                         "dest_write_mode": _get_dest_write_mode(job_config),
                         "docs_inserted": write_stats.get("docs_inserted", 0),
@@ -1058,12 +1088,15 @@ def bson_load_worker(worker_id: str, job_config: dict):
             batch = []
             docs_written = 0
             write_stats = _empty_write_stats()
+            field_mask_counts = {}
 
             if bson_file and os.path.exists(bson_file):
                 # Stream BSON file iteratively (Crucial for memory safety)
                 with open(bson_file, "rb") as f:
                     for doc in bson.decode_file_iter(f):
                         docs_written += 1
+                        for path, cnt in _count_masked_fields(doc, chunk_rules).items():
+                            field_mask_counts[path] = field_mask_counts.get(path, 0) + cnt
                         transformed_doc = transform_document(
                             doc,
                             chunk_rules,
@@ -1091,6 +1124,7 @@ def bson_load_worker(worker_id: str, job_config: dict):
                     "$set": {
                         "status": "LOADED",
                         "docs_written": docs_written,
+                        "field_mask_counts": field_mask_counts,
                         "dest_write_mode": _get_dest_write_mode(job_config),
                         "docs_inserted": write_stats.get("docs_inserted", 0),
                         "docs_matched": write_stats.get("docs_matched", 0),

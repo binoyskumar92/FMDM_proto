@@ -125,6 +125,31 @@ effective_mb_per_second        # MONGODUMP_STAGE only
 chunk_status_distribution      # breakdown of LOADED, FAILED, QUARANTINED, etc.
 ```
 
+### Masking Audit
+
+Each chunk record written to the bookkeeping DB includes a `field_mask_counts` field showing how many documents in that chunk had each masked field present:
+
+```json
+{ "ssn": 9841, "account.account_number": 9841, "first_name": 9823 }
+```
+
+To get a full coverage report across the entire job, run this against the bookkeeping cluster after the job completes. Update the `$group` stage with your actual field paths:
+
+```js
+db.chunks.aggregate([
+  { $match: { job_id: "your_job_id", status: "LOADED" } },
+  { $replaceRoot: { newRoot: "$field_mask_counts" } },
+  { $group: {
+      _id: null,
+      "ssn":                    { $sum: "$ssn" },
+      "account.account_number": { $sum: "$account.account_number" },
+      "first_name":             { $sum: "$first_name" }
+  }}
+])
+```
+
+This tells you the total number of documents where each sensitive field was present and masked — without storing any PII.
+
 ---
 
 ## Configuration Reference
@@ -160,8 +185,92 @@ Each entry in `collections`:
 |---|---|---|
 | `source_collection` | string | Source collection name |
 | `dest_collection` | string | Destination collection name |
-| `drop_destination_collection_before_load` | bool | Drop and recreate destination before loading. Also triggers index sync from source. |
-| `masking_fields` | array of strings | Dot-notation field paths to mask, e.g. `"host.host_name"`, `"account.ssn"` |
+| `drop_destination_collection_before_load` | bool | Drop and recreate destination before loading. Also triggers index sync from source. Recommended: `true`. |
+| `masking_fields` | array of strings | Dot-notation field paths to mask, e.g. `"host.host_name"`, `"account.ssn"`. Pass `[]` to migrate the collection without any masking. |
+
+### Config examples
+
+**With masking** — migrates a collection and masks specific PII fields:
+
+```json
+{
+    "source_collection": "customers",
+    "dest_collection": "customers",
+    "drop_destination_collection_before_load": true,
+    "masking_fields": [
+        "ssn",
+        "account.account_number",
+        "contact.email"
+    ]
+}
+```
+
+**Without masking** — pure migration, no fields touched. Passing an empty array causes `transform_document` to return the document unchanged:
+
+```json
+{
+    "source_collection": "reference_data",
+    "dest_collection": "reference_data",
+    "drop_destination_collection_before_load": true,
+    "masking_fields": []
+}
+```
+
+Both can be mixed freely in the same job under `collections`.
+
+### Full config example
+
+```json
+{
+    "job_id": "prod_to_nonprod_run_001",
+    "mode": "DIRECT_STREAM",
+    "source_uri": "mongodb+srv://<user>:<pass>@source-cluster.mongodb.net/",
+    "dest_uri": "mongodb+srv://<user>:<pass>@dest-cluster.mongodb.net/",
+    "bookkeeping_uri": "mongodb+srv://<user>:<pass>@dest-cluster.mongodb.net/",
+    "source_db": "financial_data",
+    "dest_db": "financial_data_nonprod",
+    "dest_write_mode": "INSERT_THEN_UPSERT_ON_DUP",
+    "staging_root": "/tmp/mongo_staging",
+    "chunk_window_hours": 1,
+    "max_docs_per_chunk": 100000,
+    "max_retries": 3,
+    "src_batch_size": 2000,
+    "dest_batch_size": 1000,
+    "stream_workers": 10,
+    "dump_workers": 4,
+    "load_workers": 4,
+    "max_backlog_chunks": 10,
+    "lease_hours": 1,
+    "collections": [
+        {
+            "source_collection": "customers",
+            "dest_collection": "customers",
+            "drop_destination_collection_before_load": true,
+            "masking_fields": [
+                "ssn",
+                "account.account_number",
+                "contact.email",
+                "contact.phone"
+            ]
+        },
+        {
+            "source_collection": "transactions",
+            "dest_collection": "transactions",
+            "drop_destination_collection_before_load": true,
+            "masking_fields": [
+                "card.card_number",
+                "card.holder_name"
+            ]
+        },
+        {
+            "source_collection": "reference_data",
+            "dest_collection": "reference_data",
+            "drop_destination_collection_before_load": true,
+            "masking_fields": []
+        }
+    ]
+}
+```
 
 ---
 
