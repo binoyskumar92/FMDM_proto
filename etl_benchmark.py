@@ -150,13 +150,17 @@ def initialize_bookkeeping(db_uri: str, job_config: dict):
 
         src_client.close()
         dest_client.close()
+        # Strip runtime-injected keys before persisting — hash_salt_bytes and
+        # _rules_map are derived at startup and must not be stored in the DB.
+        _RUNTIME_KEYS = {"hash_salt_bytes", "_rules_map"}
+        config_snapshot = {k: v for k, v in job_config.items() if k not in _RUNTIME_KEYS}
         db.jobs.insert_one(
             {
                 "job_id": job_config["job_id"],
                 "mode": job_config["mode"],
                 "status": "CREATED",
                 "created_at": datetime.now(timezone.utc),
-                "config_snapshot": job_config,
+                "config_snapshot": config_snapshot,
             }
         )
     else:
@@ -497,7 +501,40 @@ def plan_chunks(job_config):
         global_min_id = min_doc[0]["_id"]
         global_max_id = max_doc[0]["_id"]
 
+        # Preflight Check for ObjectId
+        if not isinstance(global_min_id, ObjectId):
+            logging.error(
+                f"CRITICAL: {src_coll_name} uses {type(global_min_id)} for _id."
+            )
+            raise TypeError(
+                f"Collection {src_coll_name} uses non-ObjectId _ids. This tool requires ObjectId."
+            )
+
         current_lower_bound = global_min_id
+
+        # Single-Document Edge Case
+        if global_min_id == global_max_id:
+            logging.info(
+                f"Collection {src_coll_name} has exactly 1 document. Planning single chunk."
+            )
+            safe_upper_bound = _int_to_objectid(_objectid_to_int(global_min_id) + 1)
+
+            chunks_to_insert.append(
+                {
+                    "chunk_id": f"{job_config['job_id']}_{src_coll_name}_{global_seq}",
+                    "job_id": job_config["job_id"],
+                    "source_collection": src_coll_name,
+                    "dest_collection": dest_coll_name,
+                    "chunk_sequence": global_seq,
+                    "lower_bound": global_min_id,
+                    "upper_bound": safe_upper_bound,
+                    "docs_read_estimate": 1,
+                    "status": ready_status,
+                    "attempts": 0,
+                }
+            )
+            global_seq += 1
+            continue
 
         while current_lower_bound < global_max_id:
 
@@ -859,9 +896,18 @@ def direct_stream_worker(worker_id: str, job_config: dict):
             logging.error(
                 f"Worker {worker_id} failed chunk {chunk['chunk_sequence']}: {e}"
             )
+            is_quarantined = chunk["attempts"] >= job_config["max_retries"]
+            fail_status = "QUARANTINED_STREAM" if is_quarantined else "FAILED_STREAM"
+
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
-                {"$set": {"status": "FAILED_STREAM", "last_error_sanitized": str(e)}},
+                {
+                    "$set": {
+                        "status": fail_status,
+                        "last_error_sanitized": str(e),
+                        "failed_at": datetime.now(timezone.utc),
+                    }
+                },
             )
 
 
@@ -957,9 +1003,18 @@ def mongodump_worker(worker_id: str, job_config: dict):
             logging.error(
                 f"Dump {worker_id} failed chunk {chunk['chunk_sequence']}: {e}"
             )
+            is_quarantined = chunk["attempts"] >= job_config["max_retries"]
+            fail_status = "QUARANTINED_DUMP" if is_quarantined else "FAILED_DUMP"
+
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
-                {"$set": {"status": "FAILED_DUMP", "last_error_sanitized": str(e)}},
+                {
+                    "$set": {
+                        "status": fail_status,
+                        "last_error_sanitized": str(e),
+                        "failed_at": datetime.now(timezone.utc),
+                    }
+                },
             )
 
 
@@ -1069,9 +1124,18 @@ def bson_load_worker(worker_id: str, job_config: dict):
             logging.error(
                 f"Load {worker_id} failed chunk {chunk['chunk_sequence']}: {e}"
             )
+            is_quarantined = chunk["attempts"] >= job_config["max_retries"]
+            fail_status = "QUARANTINED_LOAD" if is_quarantined else "FAILED_LOAD"
+
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
-                {"$set": {"status": "FAILED_LOAD", "last_error_sanitized": str(e)}},
+                {
+                    "$set": {
+                        "status": fail_status,
+                        "last_error_sanitized": str(e),
+                        "failed_at": datetime.now(timezone.utc),
+                    }
+                },
             )
 
 
@@ -1089,7 +1153,9 @@ def run_benchmark(config_file_path: str):
         )
 
     # 2. Inject it safely into memory for the workers to use
-    job_config["hash_salt_bytes"] = hash_salt_str.encode("utf-8")
+    # bytes.fromhex() decodes the hex string to raw bytes (32 bytes for a 64-char hex salt).
+    # encode("utf-8") was incorrect — it would use the ASCII bytes of the hex string instead.
+    job_config["hash_salt_bytes"] = bytes.fromhex(hash_salt_str)
 
     # 3. Pre-compute the masking rules into a fast lookup dictionary for workers
     rules_map = {}
@@ -1160,6 +1226,31 @@ def run_benchmark(config_file_path: str):
     bk_client = MongoClient(job_config["bookkeeping_uri"])
     db = bk_client["masking_control"]
 
+    status_pipeline = [
+        {"$match": {"job_id": job_config["job_id"]}},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+    ]
+    status_distribution = {
+        doc["_id"]: doc["count"] for doc in db.chunks.aggregate(status_pipeline)
+    }
+
+    failed_chunks = sum(
+        v for k, v in status_distribution.items() if "FAILED" in k or "QUARANTINED" in k
+    )
+    active_chunks = sum(
+        v
+        for k, v in status_distribution.items()
+        if k in ["READY", "STREAMING", "DUMPING", "LOADING"]
+    )
+
+    # Determine True Job Status
+    if failed_chunks > 0:
+        final_job_status = "PARTIAL_SUCCESS_WITH_ERRORS"
+    elif active_chunks > 0:
+        final_job_status = "STALLED_ABORTED"  # Workers exited but work remains
+    else:
+        final_job_status = "COMPLETED"
+
     target_status = "LOADED" if job_config["mode"] == "DIRECT_STREAM" else "RAW_DELETED"
 
     pipeline = [
@@ -1213,7 +1304,8 @@ def run_benchmark(config_file_path: str):
     )
 
     summary = {
-        "status": "COMPLETED",
+        "status": final_job_status,
+        "chunk_status_distribution": status_distribution,
         "total_runtime_seconds": round(overall_duration, 2),
         "total_docs_written": metrics["total_docs"],
         "total_dump_bytes": metrics["total_dump_bytes"],
