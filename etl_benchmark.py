@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -153,7 +154,9 @@ def initialize_bookkeeping(db_uri: str, job_config: dict):
         # Strip runtime-injected keys before persisting — hash_salt_bytes and
         # _rules_map are derived at startup and must not be stored in the DB.
         _RUNTIME_KEYS = {"hash_salt_bytes", "_rules_map"}
-        config_snapshot = {k: v for k, v in job_config.items() if k not in _RUNTIME_KEYS}
+        config_snapshot = {
+            k: v for k, v in job_config.items() if k not in _RUNTIME_KEYS
+        }
         db.jobs.insert_one(
             {
                 "job_id": job_config["job_id"],
@@ -459,6 +462,97 @@ def get_optimal_upper_bound(
     return naive_upper_oid, doc_count
 
 
+# ==========================================
+# MODULE 3b: BUCKET AUTO PLANNER (non-ObjectId)
+# ==========================================
+def _plan_chunks_index_walk(
+    coll, coll_config, job_config, db, global_seq, global_min_id
+) -> int:
+    """
+    Plans chunks for non-ObjectId collections by walking the _id index.
+
+    Dynamically adjusts chunk sizes for massive collections to protect
+    the orchestrator and database from excessive network round trips.
+    """
+    src_coll_name = coll_config["source_collection"]
+    dest_coll_name = coll_config["dest_collection"]
+    ready_status = "READY" if job_config["mode"] == "DIRECT_STREAM" else "READY_TO_DUMP"
+
+    estimated_total = coll.estimated_document_count()
+    if estimated_total == 0:
+        logging.info(f"Collection {src_coll_name} is empty. Skipping.")
+        return global_seq
+
+    # 1. DYNAMIC CHUNK SIZING
+    # Hard cap the maximum number of chunks we are willing to plan for a single collection
+    # to protect Python memory and prevent network latency death by a thousand cuts.
+    HARD_CHUNK_CAP = 20000
+
+    dynamic_max_docs = max(
+        job_config["max_docs_per_chunk"], math.ceil(estimated_total / HARD_CHUNK_CAP)
+    )
+
+    logging.info(
+        f"Index walk planning for {src_coll_name}: ~{estimated_total:,} docs. "
+        f"Dynamic chunk size set to {dynamic_max_docs:,}."
+    )
+
+    current_lower_bound = global_min_id
+    chunks_to_insert = []
+
+    while current_lower_bound is not None:
+        # 2. THE INDEX WALK
+        # Query strictly greater than our last boundary, skip ahead by the chunk size,
+        # and pull exactly 1 document to serve as our next boundary.
+        cursor = (
+            coll.find({"_id": {"$gt": current_lower_bound}}, {"_id": 1})
+            .sort("_id", 1)
+            .skip(dynamic_max_docs - 1)
+            .limit(1)
+            .hint("_id_")
+        )
+
+        boundary_docs = list(cursor)
+
+        if boundary_docs:
+            upper_bound = boundary_docs[0]["_id"]
+            is_last = False
+        else:
+            # We hit the end of the collection
+            upper_bound = None
+            is_last = True
+
+        chunks_to_insert.append(
+            {
+                "chunk_id": f"{job_config['job_id']}_{src_coll_name}_{global_seq}",
+                "job_id": job_config["job_id"],
+                "source_collection": src_coll_name,
+                "dest_collection": dest_coll_name,
+                "chunk_sequence": global_seq,
+                "lower_bound": current_lower_bound,
+                "upper_bound": upper_bound,
+                "docs_read_estimate": dynamic_max_docs,
+                "status": ready_status,
+                "attempts": 0,
+                "planner": "index_walk",
+            }
+        )
+
+        global_seq += 1
+        current_lower_bound = upper_bound
+
+        # Batch insert to bookkeeping to keep memory flat
+        if len(chunks_to_insert) >= 1000:
+            db.chunks.insert_many(chunks_to_insert)
+            chunks_to_insert = []
+
+    if chunks_to_insert:
+        db.chunks.insert_many(chunks_to_insert)
+
+    logging.info(f"Index walk planned chunks for {src_coll_name}.")
+    return global_seq
+
+
 def plan_chunks(job_config):
     """Generates sequential, density-aware chunk boundaries with timer for all collections."""
     bk_client = MongoClient(job_config["bookkeeping_uri"])
@@ -501,14 +595,25 @@ def plan_chunks(job_config):
         global_min_id = min_doc[0]["_id"]
         global_max_id = max_doc[0]["_id"]
 
-        # Preflight Check for ObjectId
-        if not isinstance(global_min_id, ObjectId):
-            logging.error(
-                f"CRITICAL: {src_coll_name} uses {type(global_min_id)} for _id."
+        # Non-ObjectId collections: route to $bucketAuto planner.
+        # MONGODUMP_STAGE is not supported for non-ObjectId because mongodump's
+        # --query flag uses $oid syntax which is ObjectId-specific.
+        # if not isinstance(global_min_id, ObjectId):
+        if True:
+            id_type = type(global_min_id).__name__
+            if job_config["mode"] == "MONGODUMP_STAGE":
+                raise TypeError(
+                    f"Collection {src_coll_name} uses {id_type} _ids. "
+                    f"MONGODUMP_STAGE requires ObjectId. Use DIRECT_STREAM for non-ObjectId collections."
+                )
+            logging.info(
+                f"Collection {src_coll_name} uses {id_type} _ids — "
+                f"switching to index walk planner."
             )
-            raise TypeError(
-                f"Collection {src_coll_name} uses non-ObjectId _ids. This tool requires ObjectId."
+            global_seq = _plan_chunks_index_walk(
+                coll, coll_config, job_config, db, global_seq, global_min_id
             )
+            continue
 
         current_lower_bound = global_min_id
 
@@ -862,7 +967,14 @@ def direct_stream_worker(worker_id: str, job_config: dict):
 
             chunk_rules = job_config["_rules_map"].get(src_coll_name, [])
 
-            query = {"_id": {"$gte": chunk["lower_bound"], "$lt": chunk["upper_bound"]}}
+            lower = chunk.get("lower_bound")
+            upper = chunk.get("upper_bound")
+            if lower is None:
+                query = {}  # full collection scan
+            elif upper is None:
+                query = {"_id": {"$gte": lower}}  # open-ended (last bucket_auto chunk)
+            else:
+                query = {"_id": {"$gte": lower, "$lt": upper}}  # normal half-open range
             cursor = (
                 src_coll.find(query)
                 .hint("_id_")
@@ -1096,7 +1208,9 @@ def bson_load_worker(worker_id: str, job_config: dict):
                     for doc in bson.decode_file_iter(f):
                         docs_written += 1
                         for path, cnt in _count_masked_fields(doc, chunk_rules).items():
-                            field_mask_counts[path] = field_mask_counts.get(path, 0) + cnt
+                            field_mask_counts[path] = (
+                                field_mask_counts.get(path, 0) + cnt
+                            )
                         transformed_doc = transform_document(
                             doc,
                             chunk_rules,

@@ -62,12 +62,13 @@ def preview_config(config_data: dict):
 
 def get_bookkeeping_db(config_data: dict):
     """Return a pymongo DB handle for the bookkeeping cluster, or None on failure."""
+    from pymongo import MongoClient
+    client = MongoClient(config_data["bookkeeping_uri"], serverSelectionTimeoutMS=4000)
     try:
-        from pymongo import MongoClient
-        client = MongoClient(config_data["bookkeeping_uri"], serverSelectionTimeoutMS=4000)
         client.admin.command("ping")
         return client["masking_control"]
     except Exception:
+        client.close()
         return None
 
 
@@ -92,14 +93,15 @@ def check_connectivity(config_data: dict) -> bool:
             console.print(f"  [yellow]⚠  {name}: URI not set[/yellow]")
             all_ok = False
             continue
+        client = MongoClient(uri, serverSelectionTimeoutMS=4000)
         try:
-            client = MongoClient(uri, serverSelectionTimeoutMS=4000)
             client.admin.command("ping")
-            client.close()
             console.print(f"  [green]✓  {name}[/green]")
         except Exception as e:
             console.print(f"  [red]✗  {name}: {e}[/red]")
             all_ok = False
+        finally:
+            client.close()
 
     return all_ok
 
@@ -118,35 +120,53 @@ def check_resume(config_data: dict) -> bool:
     if db is None:
         return True  # Can't check — let the ETL handle it
 
-    job_id = config_data["job_id"]
-    existing = db.jobs.find_one({"job_id": job_id})
-    if not existing:
-        return True  # Fresh job, nothing to warn about
+    try:
+        job_id = config_data["job_id"]
+        existing = db.jobs.find_one({"job_id": job_id})
+        if not existing:
+            return True  # Fresh job, nothing to warn about
 
-    status = existing.get("status", "UNKNOWN")
-    created_at = existing.get("created_at", "unknown")
-    total_chunks = existing.get("total_chunks", "?")
-    completed = db.chunks.count_documents(
-        {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}}
-    )
-    failed = db.chunks.count_documents(
-        {"job_id": job_id, "status": {"$regex": "FAILED|QUARANTINED"}}
-    )
+        status = existing.get("status", "UNKNOWN")
+        created_at = existing.get("created_at", "unknown")
+        total_chunks = existing.get("total_chunks", "?")
+        completed = db.chunks.count_documents(
+            {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}}
+        )
+        failed = db.chunks.count_documents(
+            {"job_id": job_id, "status": {"$regex": "FAILED|QUARANTINED"}}
+        )
 
-    t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-    t.add_column(style="dim", min_width=14)
-    t.add_column()
-    t.add_row("Job ID",    job_id)
-    t.add_row("Status",    status)
-    t.add_row("Created",   str(created_at))
-    t.add_row("Progress",  f"{completed} / {total_chunks} chunks loaded")
-    t.add_row("Failed",    f"[red]{failed}[/red]" if failed else "0")
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column(style="dim", min_width=14)
+        t.add_column()
+        t.add_row("Job ID",    job_id)
+        t.add_row("Status",    status)
+        t.add_row("Created",   str(created_at))
+        t.add_row("Progress",  f"{completed} / {total_chunks} chunks loaded")
+        t.add_row("Failed",    f"[red]{failed}[/red]" if failed else "0")
 
-    console.print(Panel(t, title="[bold yellow]⚠  Existing job found[/bold yellow]", border_style="yellow"))
-    console.print("[dim]Same job_id → the job will RESUME from where it left off.[/dim]")
-    console.print("[dim]To start fresh, change job_id in your config file.[/dim]\n")
+        # Terminal states: job is done, re-running will write 0 docs.
+        TERMINAL_STATUSES = {"COMPLETED", "PARTIAL_SUCCESS_WITH_ERRORS"}
+        if status in TERMINAL_STATUSES:
+            console.print(Panel(
+                t,
+                title="[bold red]✗  Job already finished[/bold red]",
+                border_style="red",
+            ))
+            console.print(
+                f"[bold red]This job is {status}. Re-running with the same job_id will "
+                f"write 0 documents — all chunks are already in a terminal state.[/bold red]"
+            )
+            console.print("[dim]Change job_id in your config file to start a fresh migration.[/dim]\n")
+            return False
 
-    return bool(questionary.confirm("Resume this job?", default=True).ask())
+        console.print(Panel(t, title="[bold yellow]⚠  Existing job found[/bold yellow]", border_style="yellow"))
+        console.print("[dim]Same job_id → the job will RESUME from where it left off.[/dim]")
+        console.print("[dim]To start fresh, change job_id in your config file.[/dim]\n")
+
+        return bool(questionary.confirm("Resume this job?", default=True).ask())
+    finally:
+        db.client.close()
 
 
 # ==========================================
@@ -155,54 +175,66 @@ def check_resume(config_data: dict) -> bool:
 
 def show_audit_report(config_data: dict):
     """
-    Aggregate field_mask_counts across all completed chunks and show
-    per-field coverage as a percentage of total docs written.
+    Aggregate field_mask_counts per collection and show per-field coverage
+    as a percentage of that collection's docs written.
     """
     db = get_bookkeeping_db(config_data)
     if db is None:
         console.print("[yellow]Could not reach bookkeeping DB — skipping audit report.[/yellow]")
         return
 
-    job_id = config_data["job_id"]
+    try:
+        job_id = config_data["job_id"]
 
-    # Collect expected fields from config
-    all_fields = []
-    for coll in config_data.get("collections", []):
-        for field in coll.get("masking_fields", []):
-            if field not in all_fields:
-                all_fields.append(field)
+        # Build expected masking fields per collection from config
+        coll_fields: dict[str, list] = {}
+        for coll in config_data.get("collections", []):
+            fields = coll.get("masking_fields", [])
+            if fields:
+                coll_fields[coll["source_collection"]] = fields
 
-    if not all_fields:
-        return
+        if not coll_fields:
+            return
 
-    # Sum field_mask_counts and docs_written across all completed chunks
-    totals = {}
-    total_docs = 0
-    for chunk in db.chunks.find(
-        {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}},
-        {"field_mask_counts": 1, "docs_written": 1},
-    ):
-        total_docs += chunk.get("docs_written", 0)
-        for field, count in chunk.get("field_mask_counts", {}).items():
-            totals[field] = totals.get(field, 0) + count
+        # Aggregate per-collection: docs_written and field_mask_counts
+        # coll_stats[src_coll] = {"_docs": int, "<field>": int, ...}
+        coll_stats: dict[str, dict] = {}
+        for chunk in db.chunks.find(
+            {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}},
+            {"field_mask_counts": 1, "docs_written": 1, "source_collection": 1},
+        ):
+            src = chunk.get("source_collection", "unknown")
+            if src not in coll_stats:
+                coll_stats[src] = {"_docs": 0}
+            coll_stats[src]["_docs"] += chunk.get("docs_written", 0)
+            for field, count in chunk.get("field_mask_counts", {}).items():
+                coll_stats[src][field] = coll_stats[src].get(field, 0) + count
 
-    if total_docs == 0:
-        console.print("[yellow]No completed chunks found for audit report.[/yellow]")
-        return
+        if not coll_stats:
+            console.print("[yellow]No completed chunks found for audit report.[/yellow]")
+            return
 
-    t = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
-    t.add_column("Field", style="cyan")
-    t.add_column("Docs Masked", justify="right")
-    t.add_column("Coverage", justify="right")
+        t = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
+        t.add_column("Collection", style="dim")
+        t.add_column("Field", style="cyan")
+        t.add_column("Docs Masked", justify="right")
+        t.add_column("Coverage", justify="right")
 
-    for field in sorted(all_fields):
-        count = totals.get(field, 0)
-        pct = count / total_docs * 100 if total_docs else 0
-        color = "green" if pct >= 99.9 else "yellow" if pct > 0 else "red"
-        t.add_row(field, f"{count:,}", f"[{color}]{pct:.1f}%[/{color}]")
+        total_docs_all = 0
+        for src_coll in sorted(coll_stats.keys()):
+            stats = coll_stats[src_coll]
+            coll_docs = stats["_docs"]
+            total_docs_all += coll_docs
+            for field in sorted(coll_fields.get(src_coll, [])):
+                count = stats.get(field, 0)
+                pct = count / coll_docs * 100 if coll_docs else 0
+                color = "green" if pct >= 99.9 else "yellow" if pct > 0 else "red"
+                t.add_row(src_coll, field, f"{count:,}", f"[{color}]{pct:.1f}%[/{color}]")
 
-    console.print(Panel(t, title="[bold]Masking Audit Report[/bold]", border_style="cyan"))
-    console.print(f"[dim]Total docs written: {total_docs:,}[/dim]")
+        console.print(Panel(t, title="[bold]Masking Audit Report[/bold]", border_style="cyan"))
+        console.print(f"[dim]Total docs written: {total_docs_all:,}[/dim]")
+    finally:
+        db.client.close()
 
 
 # ==========================================
@@ -216,44 +248,47 @@ def show_job_history(config_data: dict):
         console.print("[red]Could not connect to bookkeeping DB.[/red]")
         return
 
-    jobs = list(db.jobs.find({}, sort=[("created_at", -1)], limit=10))
-    if not jobs:
-        console.print("[yellow]No jobs found in the bookkeeping database.[/yellow]")
-        return
+    try:
+        jobs = list(db.jobs.find({}, sort=[("created_at", -1)], limit=10))
+        if not jobs:
+            console.print("[yellow]No jobs found in the bookkeeping database.[/yellow]")
+            return
 
-    t = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
-    t.add_column("Job ID", style="cyan")
-    t.add_column("Mode")
-    t.add_column("Status")
-    t.add_column("Chunks")
-    t.add_column("Docs Written", justify="right")
-    t.add_column("Created")
+        t = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
+        t.add_column("Job ID", style="cyan")
+        t.add_column("Mode")
+        t.add_column("Status")
+        t.add_column("Chunks")
+        t.add_column("Docs Written", justify="right")
+        t.add_column("Created")
 
-    for job in jobs:
-        job_id   = job.get("job_id", "?")
-        mode     = job.get("mode", "?")
-        status   = job.get("status", "?")
-        chunks   = str(job.get("total_chunks", "?"))
-        docs     = job.get("total_docs_written", 0)
-        created  = job.get("created_at")
+        for job in jobs:
+            job_id   = job.get("job_id", "?")
+            mode     = job.get("mode", "?")
+            status   = job.get("status", "?")
+            chunks   = str(job.get("total_chunks", "?"))
+            docs     = job.get("total_docs_written", 0)
+            created  = job.get("created_at")
 
-        if "COMPLETED" in status:
-            color = "green"
-        elif status in ("RUNNING", "PLANNING"):
-            color = "cyan"
-        else:
-            color = "yellow"
+            if "COMPLETED" in status:
+                color = "green"
+            elif status in ("RUNNING", "PLANNING"):
+                color = "cyan"
+            else:
+                color = "yellow"
 
-        t.add_row(
-            job_id,
-            mode,
-            f"[{color}]{status}[/{color}]",
-            chunks,
-            f"{docs:,}" if isinstance(docs, int) else "—",
-            created.strftime("%Y-%m-%d %H:%M") if created else "?",
-        )
+            t.add_row(
+                job_id,
+                mode,
+                f"[{color}]{status}[/{color}]",
+                chunks,
+                f"{docs:,}" if isinstance(docs, int) else "—",
+                created.strftime("%Y-%m-%d %H:%M") if created else "?",
+            )
 
-    console.print(Panel(t, title="[bold]Recent Jobs[/bold]", border_style="cyan"))
+        console.print(Panel(t, title="[bold]Recent Jobs[/bold]", border_style="cyan"))
+    finally:
+        db.client.close()
 
 
 # ==========================================
@@ -271,48 +306,55 @@ def stop_job(config_data: dict):
         console.print("[red]Could not connect to bookkeeping DB.[/red]")
         return
 
-    job_id = config_data["job_id"]
-    session = db.wizard_sessions.find_one({"job_id": job_id})
-
-    if not session or not session.get("etl_pid"):
-        console.print(f"[yellow]No PID found for job '{job_id}'.[/yellow]")
-        console.print("[dim]This job may not have been launched from this wizard, or the record was cleared.[/dim]")
-        return
-
-    pid = session["etl_pid"]
-
-    # Verify the process is actually running before asking for confirmation
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        console.print(f"[yellow]Process {pid} is not running — job may have already finished or crashed.[/yellow]")
-        job = db.jobs.find_one({"job_id": job_id}, {"status": 1})
-        if job:
-            console.print(f"[dim]Last known status: {job.get('status', 'UNKNOWN')}[/dim]")
-        return
-    except PermissionError:
-        pass  # Process exists, permission issue only for signal 0 — proceed
+        job_id = config_data["job_id"]
+        session = db.wizard_sessions.find_one({"job_id": job_id})
 
-    confirmed = questionary.confirm(
-        f"Stop job '{job_id}' (PID: {pid})? In-progress chunks will be reset to READY on next resume.",
-        default=False,
-    ).ask()
-    if not confirmed:
-        return
+        if not session or not session.get("etl_pid"):
+            console.print(f"[yellow]No PID found for job '{job_id}'.[/yellow]")
+            console.print("[dim]This job may not have been launched from this wizard, or the record was cleared.[/dim]")
+            return
 
-    try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
-        console.print(f"[green]✓ Sent SIGTERM to process group {pgid} (ETL + all workers)[/green]")
+        pid = session["etl_pid"]
 
-        db.jobs.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "STOPPED_BY_USER", "stopped_at": datetime.now(timezone.utc)}},
-        )
-        console.print("[dim]Status updated to STOPPED_BY_USER. Resume anytime using the same job_id.[/dim]")
+        # Verify the process is actually running before asking for confirmation
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            console.print(f"[yellow]Process {pid} is not running — job may have already finished or crashed.[/yellow]")
+            job = db.jobs.find_one({"job_id": job_id}, {"status": 1})
+            if job:
+                console.print(f"[dim]Last known status: {job.get('status', 'UNKNOWN')}[/dim]")
+            return
+        except PermissionError:
+            pass  # Process exists, permission issue only for signal 0 — proceed
 
-    except Exception as e:
-        console.print(f"[red]Failed to stop job: {e}[/red]")
+        confirmed = questionary.confirm(
+            f"Stop job '{job_id}' (PID: {pid})? In-progress chunks will be reset to READY on next resume.",
+            default=False,
+        ).ask()
+        if not confirmed:
+            return
+
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+            console.print(f"[green]✓ Sent SIGTERM to process group {pgid} (ETL + all workers)[/green]")
+
+            db.jobs.update_one(
+                {"job_id": job_id},
+                {"$set": {"status": "STOPPED_BY_USER", "stopped_at": datetime.now(timezone.utc)}},
+            )
+            db.wizard_sessions.update_one(
+                {"job_id": job_id},
+                {"$set": {"etl_pid": None, "stopped_at": datetime.now(timezone.utc)}},
+            )
+            console.print("[dim]Status updated to STOPPED_BY_USER. Resume anytime using the same job_id.[/dim]")
+
+        except Exception as e:
+            console.print(f"[red]Failed to stop job: {e}[/red]")
+    finally:
+        db.client.close()
 
 
 # ==========================================
@@ -334,7 +376,7 @@ def build_status_panel(db, job_id: str, start_time: float, running=None) -> Pane
             ])
         }
 
-        total      = sum(dist.values()) or 1
+        total      = sum(dist.values())
         loaded     = dist.get("LOADED", 0) + dist.get("RAW_DELETED", 0)
         in_prog    = sum(v for k, v in dist.items() if k in {"STREAMING", "DUMPING", "LOADING"})
         remaining  = sum(v for k, v in dist.items() if k in {"READY", "READY_TO_DUMP"})
@@ -350,9 +392,12 @@ def build_status_panel(db, job_id: str, start_time: float, running=None) -> Pane
         ]))
         total_docs = docs_agg[0]["total"] if docs_agg else 0
 
-        pct    = loaded / total * 100
-        filled = int(pct / 5)
-        bar    = f"[{'█' * filled}{'░' * (20 - filled)}] {loaded}/{total} ({pct:.1f}%)"
+        if total == 0:
+            bar = "[cyan]Planning chunks...[/cyan]" if running else "[yellow]No chunks found — job may have done nothing[/yellow]"
+        else:
+            pct    = loaded / total * 100
+            filled = int(pct / 5)
+            bar    = f"[{'█' * filled}{'░' * (20 - filled)}] {loaded}/{total} ({pct:.1f}%)"
 
         elapsed     = time.time() - start_time
         elapsed_str = f"{int(elapsed // 3600):02d}:{int((elapsed % 3600) // 60):02d}:{int(elapsed % 60):02d}"
@@ -447,11 +492,14 @@ def launch_job(selected_config: str, config_data: dict, env_vars: dict):
     try:
         db = get_bookkeeping_db(config_data)
         if db is not None:
-            db.wizard_sessions.update_one(
-                {"job_id": job_id},
-                {"$set": {"etl_pid": proc.pid, "started_at": datetime.now(timezone.utc), "log": log_path}},
-                upsert=True,
-            )
+            try:
+                db.wizard_sessions.update_one(
+                    {"job_id": job_id},
+                    {"$set": {"etl_pid": proc.pid, "started_at": datetime.now(timezone.utc), "log": log_path}},
+                    upsert=True,
+                )
+            finally:
+                db.client.close()
     except Exception:
         pass  # Non-critical — job still runs fine without this
 
@@ -464,8 +512,25 @@ def launch_job(selected_config: str, config_data: dict, env_vars: dict):
         return
 
     if proc.returncode == 0:
-        console.print("\n[bold green]✓ Job completed successfully.[/bold green]\n")
-        show_audit_report(config_data)
+        docs_written = 0
+        db = get_bookkeeping_db(config_data)
+        if db is not None:
+            try:
+                agg = list(db.chunks.aggregate([
+                    {"$match": {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}}},
+                    {"$group": {"_id": None, "total": {"$sum": "$docs_written"}}},
+                ]))
+                docs_written = agg[0]["total"] if agg else 0
+            finally:
+                db.client.close()
+
+        if docs_written == 0:
+            console.print("\n[bold yellow]⚠  Job exited cleanly but wrote 0 documents.[/bold yellow]")
+            console.print("[dim]All chunks may already be in a terminal state from a previous run.[/dim]")
+            console.print("[dim]Change job_id in your config file to start a fresh migration.[/dim]\n")
+        else:
+            console.print("\n[bold green]✓ Job completed successfully.[/bold green]\n")
+            show_audit_report(config_data)
     else:
         console.print(f"\n[bold red]✗ ETL exited with code {proc.returncode}. Check {log_path}[/bold red]")
 
@@ -549,7 +614,17 @@ def main():
         ).ask()
         if not new_job_id:
             continue
-        config_data["job_id"] = new_job_id.strip()
+        new_job_id = new_job_id.strip()
+        config_data["job_id"] = new_job_id
+
+        # Persist the new job_id back to the config file so it survives restarts.
+        if new_job_id != current_job_id:
+            try:
+                with open(selected_config, "w") as f:
+                    json.dump(config_data, f, indent=4)
+                console.print(f"[dim]job_id updated in {selected_config}[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]Could not save job_id to config: {e}[/yellow]")
 
         # Resume detection
         if not check_resume(config_data):
