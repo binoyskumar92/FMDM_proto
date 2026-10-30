@@ -17,6 +17,7 @@ from pymongo.errors import BulkWriteError, OperationFailure
 from bson.objectid import ObjectId
 import hmac
 import hashlib
+from bson import json_util
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,16 +28,42 @@ logging.basicConfig(
 # ==========================================
 # MODULE 1: PLUGGABLE TRANSFORM ENGINE
 # ==========================================
+class UnmaskableDataError(Exception):
+    """Raised when the masking engine encounters data types it cannot safely process."""
+
+    pass
+
+
 def _mask_hash(value, salt: bytes):
     """HMAC-SHA256 hash masking preserving digits, letters, and symbols."""
     if value is None:
         return None
-    s = str(value)
+
+    # GUARDRAIL 1: Explicitly reject complex objects instead of stringifying them
+    if isinstance(value, (dict, list)):
+        raise UnmaskableDataError(
+            f"Cannot mask nested object/array at a scalar path. Type: {type(value).__name__}"
+        )
+
+    # GUARDRAIL 2: Safely handle raw binary data
+    if isinstance(value, bytes):
+        try:
+            s = value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise UnmaskableDataError(
+                "Encountered raw binary/cipher text that cannot be decoded to UTF-8."
+            )
+    else:
+        s = str(value)
+
     if not s:
         return s
 
-    # 1. Create the cryptographic hash
-    digest = hmac.new(salt, s.encode("utf-8"), hashlib.sha256).digest()
+    # GUARDRAIL 3: Catch any lingering encoding failures before they crash the worker
+    try:
+        digest = hmac.new(salt, s.encode("utf-8"), hashlib.sha256).digest()
+    except Exception as e:
+        raise UnmaskableDataError(f"UTF-8 Encoding failure during hash generation: {e}")
 
     # Stretch the digest if the input is longer than 32 chars
     while len(digest) < len(s):
@@ -47,31 +74,36 @@ def _mask_hash(value, salt: bytes):
     # 2. Universal Shape-Preserving Loop
     for i, ch in enumerate(s):
         if ch.isdigit():
-            # Replace digits with pseudo-random digits (0-9)
             out_chars.append(str(digest[i] % 10))
-
         elif ch.isalpha():
-            # Replace letters with pseudo-random letters (A-Z or a-z)
-            # The modulo 26 ensures it stays within the alphabet
             shift = digest[i] % 26
             if ch.isupper():
                 out_chars.append(chr(ord("A") + shift))
             else:
                 out_chars.append(chr(ord("a") + shift))
-
         else:
-            # Preserve all symbols: dashes, spaces, @, periods, etc.
             out_chars.append(ch)
 
     return "".join(out_chars)
 
 
-def _apply_mask_recursive(doc_part, keys, technique, salt):
-    """Recursively traverse and mask fields. Natively handles nested arrays."""
+def _apply_mask_recursive(doc_part, keys, technique, salt, substitutions=None):
+    """Recursively traverse and mask fields. Natively handles nested arrays.
+
+    substitutions: mutable list; if provided, unmaskable values are replaced with
+    MASKED_UNSUPPORTED and a (field_path_hint, reason) tuple is appended instead
+    of raising UnmaskableDataError.
+    """
     # Base case: We reached the target field
     if not keys:
         if technique.lower() == "hash":
-            return _mask_hash(doc_part, salt)
+            try:
+                return _mask_hash(doc_part, salt)
+            except UnmaskableDataError as e:
+                if substitutions is not None:
+                    substitutions.append(str(e))
+                    return "MASKED_UNSUPPORTED"
+                raise
         return doc_part  # Fallback if technique isn't recognized
 
     current_key = keys[0]
@@ -82,32 +114,36 @@ def _apply_mask_recursive(doc_part, keys, technique, salt):
         if current_key in doc_part:
             new_doc = dict(doc_part)  # Shallow copy to avoid mutating original
             new_doc[current_key] = _apply_mask_recursive(
-                doc_part[current_key], remaining_keys, technique, salt
+                doc_part[current_key], remaining_keys, technique, salt, substitutions
             )
             return new_doc
         return doc_part
 
-    # Traverse arrays (apply the rule to EVERY item in the list)
+    # Traverse arrays — pass same substitutions list so all elements share it
     elif isinstance(doc_part, list):
-        return [_apply_mask_recursive(item, keys, technique, salt) for item in doc_part]
+        return [_apply_mask_recursive(item, keys, technique, salt, substitutions) for item in doc_part]
 
     # If it's a scalar but we still have keys, the path is invalid for this doc
     return doc_part
 
 
-def transform_document(doc: dict, rules: list, salt: bytes) -> dict:
-    """Applies all masking rules to a single document."""
-    if not rules:
-        return doc
+def transform_document(doc: dict, rules: list, salt: bytes) -> tuple:
+    """Applies all masking rules to a single document.
 
+    Returns (masked_doc, substitutions) where substitutions is a list of reason
+    strings for any field that could not be masked and was replaced with
+    MASKED_UNSUPPORTED. The list is empty for clean documents.
+    """
+    if not rules:
+        return doc, []
+
+    substitutions = []
     masked = doc
     for rule in rules:
-        # Note: Your orchestrator should parse the dot-notation path into a list
-        # of keys beforehand (e.g., "data.ssn" -> ["data", "ssn"])
         masked = _apply_mask_recursive(
-            masked, rule["field_keys"], rule["technique"], salt
+            masked, rule["field_keys"], rule["technique"], salt, substitutions
         )
-    return masked
+    return masked, substitutions
 
 
 # ==========================================
@@ -233,237 +269,7 @@ def lease_next_chunk(
 
 
 # ==========================================
-# MODULE 3: DENSITY-AWARE CHUNK PLANNER
-# ==========================================
-def _count_id_range(coll, lower_bound_oid, upper_bound_oid, cap=None):
-    """
-    Count documents in an _id range using the _id index.
-
-    If cap is provided, this intentionally returns at most cap + 1. This is
-    faster for planner decisions because most calls only need to know whether
-    a range is over the configured max_docs_per_chunk threshold.
-    """
-    query = {"_id": {"$gte": lower_bound_oid, "$lt": upper_bound_oid}}
-
-    if cap is None:
-        return coll.count_documents(query, hint="_id_")
-
-    # count_documents supports limit. This avoids scanning a huge hot range
-    # when all we need is "over max" vs "safe".
-    return coll.count_documents(query, hint="_id_", limit=cap + 1)
-
-
-def _objectid_to_int(oid: ObjectId) -> int:
-    return int.from_bytes(oid.binary, "big")
-
-
-def _int_to_objectid(value: int) -> ObjectId:
-    return ObjectId(value.to_bytes(12, "big"))
-
-
-def _next_real_doc_id(coll, lower_bound_oid, inclusive=True):
-    """Return the next real document _id at or after a boundary."""
-    operator = "$gte" if inclusive else "$gt"
-    docs = list(
-        coll.find({"_id": {operator: lower_bound_oid}}, {"_id": 1})
-        .sort("_id", 1)
-        .limit(1)
-        .hint("_id_")
-    )
-    return docs[0]["_id"] if docs else None
-
-
-def _binary_search_upper_bound_by_objectid(
-    coll,
-    lower_bound_oid,
-    high_upper_oid,
-    max_docs_per_chunk,
-    max_steps=96,
-):
-    """
-    Split within ObjectId byte space when a one-second timestamp window is
-    still too dense.
-
-    This matters for synthetic load tests where many documents can share the
-    same ObjectId generation_time second. Time-based splitting alone cannot
-    safely split those hot spots.
-    """
-    low_int = _objectid_to_int(lower_bound_oid) + 1
-    high_int = _objectid_to_int(high_upper_oid)
-
-    if low_int >= high_int:
-        doc_count = _count_id_range(
-            coll, lower_bound_oid, high_upper_oid, cap=max_docs_per_chunk
-        )
-        return high_upper_oid, doc_count
-
-    best_upper_oid = None
-    best_count = 0
-    steps = 0
-
-    while low_int <= high_int and steps < max_steps:
-        steps += 1
-        mid_int = (low_int + high_int) // 2
-
-        # The upper bound is exclusive, so it must be strictly above lower.
-        if mid_int <= _objectid_to_int(lower_bound_oid):
-            low_int = mid_int + 1
-            continue
-
-        mid_oid = _int_to_objectid(mid_int)
-        doc_count = _count_id_range(
-            coll, lower_bound_oid, mid_oid, cap=max_docs_per_chunk
-        )
-
-        if doc_count <= max_docs_per_chunk:
-            best_upper_oid = mid_oid
-            best_count = doc_count
-            low_int = mid_int + 1
-        else:
-            high_int = mid_int - 1
-
-    if best_upper_oid is not None and best_upper_oid > lower_bound_oid:
-        return best_upper_oid, best_count
-
-    # Last-resort progress guard. This should only happen with invalid config,
-    # for example max_docs_per_chunk <= 0. It prevents an infinite planning loop.
-    fallback_upper_oid = _int_to_objectid(_objectid_to_int(lower_bound_oid) + 1)
-    fallback_count = _count_id_range(
-        coll, lower_bound_oid, fallback_upper_oid, cap=max_docs_per_chunk
-    )
-    return fallback_upper_oid, fallback_count
-
-
-def get_safe_upper_bound(
-    coll,
-    lower_bound_oid,
-    naive_upper_oid,
-    max_docs_per_chunk,
-    min_window_seconds=1,
-):
-    """
-    Find the largest safe upper bound that does not exceed max_docs_per_chunk.
-
-    Improvements over the original recursive halving:
-      - Uses the _id index hint for all planner counts.
-      - Uses capped counts so hot ranges do not fully scan during planning.
-      - Uses binary search instead of recursive midpoint-only shrink.
-      - Falls back to raw ObjectId byte splitting for one-second hot spots.
-    """
-    doc_count = _count_id_range(
-        coll, lower_bound_oid, naive_upper_oid, cap=max_docs_per_chunk
-    )
-
-    if doc_count <= max_docs_per_chunk:
-        return naive_upper_oid, doc_count
-
-    lower_time = lower_bound_oid.generation_time
-    upper_time = naive_upper_oid.generation_time
-    time_diff_seconds = (upper_time - lower_time).total_seconds()
-
-    # If timestamp-level splitting cannot reduce this further, split the raw
-    # ObjectId byte range so a hot second can still be chunked safely.
-    if time_diff_seconds <= min_window_seconds:
-        return _binary_search_upper_bound_by_objectid(
-            coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk
-        )
-
-    low_time = lower_time
-    high_time = upper_time
-    best_upper_oid = None
-    best_count = 0
-
-    # 64 steps is far more than enough for second-level precision across years.
-    for _ in range(64):
-        remaining_seconds = (high_time - low_time).total_seconds()
-        if remaining_seconds <= min_window_seconds:
-            break
-
-        midpoint_time = low_time + timedelta(seconds=remaining_seconds / 2)
-        midpoint_oid = ObjectId.from_datetime(midpoint_time)
-
-        # ObjectId.from_datetime truncates to timestamp seconds and zeroes the
-        # suffix. Within the same second this can fail to advance past lower.
-        if midpoint_oid <= lower_bound_oid:
-            break
-
-        doc_count = _count_id_range(
-            coll, lower_bound_oid, midpoint_oid, cap=max_docs_per_chunk
-        )
-
-        if doc_count <= max_docs_per_chunk:
-            best_upper_oid = midpoint_oid
-            best_count = doc_count
-            low_time = midpoint_time
-        else:
-            high_time = midpoint_time
-
-    if best_upper_oid is not None and best_upper_oid > lower_bound_oid:
-        return best_upper_oid, best_count
-
-    # If time-level binary search could not produce a safe boundary, split the
-    # raw ObjectId interval. This handles dense same-second distributions.
-    return _binary_search_upper_bound_by_objectid(
-        coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk
-    )
-
-
-def get_optimal_upper_bound(
-    coll,
-    lower_bound_oid,
-    initial_window_hours,
-    max_docs_per_chunk,
-    max_expansion_hours=24,
-):
-    """
-    Bi-directional planner:
-    Expands time window if under 50% capacity, shrinks if over 100% capacity.
-    """
-    min_docs_per_chunk = max(1, int(max_docs_per_chunk * 0.5))
-
-    lower_time = lower_bound_oid.generation_time
-    current_window = timedelta(hours=initial_window_hours)
-    max_window = timedelta(hours=max_expansion_hours)
-    naive_upper_oid = ObjectId.from_datetime(lower_time + current_window)
-
-    doc_count = _count_id_range(
-        coll, lower_bound_oid, naive_upper_oid, cap=max_docs_per_chunk
-    )
-
-    # If exactly 0, return immediately so the fast-forward logic in the main
-    # loop can skip the gap.
-    if doc_count == 0:
-        return naive_upper_oid, 0
-
-    # 1. EXPANSION PHASE (Too few docs, "The Trickle")
-    # Keep doubling the window until we hit 50% capacity or the safety cap.
-    while doc_count < min_docs_per_chunk and current_window < max_window:
-        next_window = min(current_window * 2, max_window)
-
-        # No progress guard for odd config values.
-        if next_window <= current_window:
-            break
-
-        current_window = next_window
-        naive_upper_oid = ObjectId.from_datetime(lower_time + current_window)
-        doc_count = _count_id_range(
-            coll, lower_bound_oid, naive_upper_oid, cap=max_docs_per_chunk
-        )
-
-        if doc_count == 0:
-            return naive_upper_oid, 0
-
-    # 2. SHRINK PHASE (Too many docs, "The Spike")
-    if doc_count > max_docs_per_chunk:
-        return get_safe_upper_bound(
-            coll, lower_bound_oid, naive_upper_oid, max_docs_per_chunk
-        )
-
-    return naive_upper_oid, doc_count
-
-
-# ==========================================
-# MODULE 3b: BUCKET AUTO PLANNER (non-ObjectId)
+# MODULE 3: BUCKET AUTO PLANNER (non-ObjectId)
 # ==========================================
 def _plan_chunks_index_walk(
     coll, coll_config, job_config, db, global_seq, global_min_id
@@ -568,148 +374,34 @@ def plan_chunks(job_config):
     )
 
     src_client = MongoClient(job_config["source_uri"])
-    ready_status = "READY" if job_config["mode"] == "DIRECT_STREAM" else "READY_TO_DUMP"
-
     global_seq = 1
-    chunks_to_insert = []
 
-    logging.info(
-        "Starting bi-directional density-aware chunk planning for all collections..."
-    )
+    logging.info("Starting universal index-walk chunk planning for all collections...")
     planning_start_time = time.time()  # START CLOCK
 
     for coll_config in job_config.get("collections", []):
         src_coll_name = coll_config["source_collection"]
-        dest_coll_name = coll_config["dest_collection"]
         coll = src_client[job_config["source_db"]][src_coll_name]
 
         logging.info(f"Planning chunks for collection: {src_coll_name}...")
 
+        # We only need the absolute minimum ID to start the walk
         min_doc = list(coll.find({}, {"_id": 1}).sort("_id", 1).limit(1).hint("_id_"))
-        max_doc = list(coll.find({}, {"_id": 1}).sort("_id", -1).limit(1).hint("_id_"))
 
-        if not min_doc or not max_doc:
+        if not min_doc:
             logging.info(f"Source collection {src_coll_name} is empty. Skipping.")
             continue
 
         global_min_id = min_doc[0]["_id"]
-        global_max_id = max_doc[0]["_id"]
 
-        # Non-ObjectId collections: route to $bucketAuto planner.
-        # MONGODUMP_STAGE is not supported for non-ObjectId because mongodump's
-        # --query flag uses $oid syntax which is ObjectId-specific.
-        # if not isinstance(global_min_id, ObjectId):
-        if True:
-            id_type = type(global_min_id).__name__
-            if job_config["mode"] == "MONGODUMP_STAGE":
-                raise TypeError(
-                    f"Collection {src_coll_name} uses {id_type} _ids. "
-                    f"MONGODUMP_STAGE requires ObjectId. Use DIRECT_STREAM for non-ObjectId collections."
-                )
-            logging.info(
-                f"Collection {src_coll_name} uses {id_type} _ids — "
-                f"switching to index walk planner."
-            )
-            global_seq = _plan_chunks_index_walk(
-                coll, coll_config, job_config, db, global_seq, global_min_id
-            )
-            continue
-
-        current_lower_bound = global_min_id
-
-        # Single-Document Edge Case
-        if global_min_id == global_max_id:
-            logging.info(
-                f"Collection {src_coll_name} has exactly 1 document. Planning single chunk."
-            )
-            safe_upper_bound = _int_to_objectid(_objectid_to_int(global_min_id) + 1)
-
-            chunks_to_insert.append(
-                {
-                    "chunk_id": f"{job_config['job_id']}_{src_coll_name}_{global_seq}",
-                    "job_id": job_config["job_id"],
-                    "source_collection": src_coll_name,
-                    "dest_collection": dest_coll_name,
-                    "chunk_sequence": global_seq,
-                    "lower_bound": global_min_id,
-                    "upper_bound": safe_upper_bound,
-                    "docs_read_estimate": 1,
-                    "status": ready_status,
-                    "attempts": 0,
-                }
-            )
-            global_seq += 1
-            continue
-
-        while current_lower_bound < global_max_id:
-
-            # Calculate optimal boundary using expand/shrink logic
-            safe_upper_bound, estimated_count = get_optimal_upper_bound(
-                coll,
-                current_lower_bound,
-                job_config["chunk_window_hours"],
-                job_config["max_docs_per_chunk"],
-            )
-
-            # Fast-forward over empty gaps (Gap Compression)
-            if estimated_count == 0:
-                next_real_doc_id = _next_real_doc_id(
-                    coll, safe_upper_bound, inclusive=True
-                )
-                if not next_real_doc_id:
-                    break
-                current_lower_bound = next_real_doc_id
-                continue
-
-            # Defensive progress guard. Without this, a pathological boundary can
-            # loop forever. This keeps the half-open range invariant intact:
-            # [current_lower_bound, safe_upper_bound)
-            if safe_upper_bound <= current_lower_bound:
-                next_real_doc_id = _next_real_doc_id(
-                    coll, current_lower_bound, inclusive=False
-                )
-                if not next_real_doc_id:
-                    break
-                safe_upper_bound = next_real_doc_id
-                estimated_count = _count_id_range(
-                    coll,
-                    current_lower_bound,
-                    safe_upper_bound,
-                    cap=job_config["max_docs_per_chunk"],
-                )
-
-            chunks_to_insert.append(
-                {
-                    "chunk_id": f"{job_config['job_id']}_{src_coll_name}_{global_seq}",
-                    "job_id": job_config["job_id"],
-                    "source_collection": src_coll_name,
-                    "dest_collection": dest_coll_name,
-                    "chunk_sequence": global_seq,
-                    "lower_bound": current_lower_bound,
-                    "upper_bound": safe_upper_bound,
-                    # Keep old field for backward compatibility with existing tests and
-                    # metrics, even though it is a document count, not bytes.
-                    "bytes_read_estimate": estimated_count,
-                    # New correctly named alias for future code.
-                    "docs_read_estimate": estimated_count,
-                    "status": ready_status,
-                    "attempts": 0,
-                }
-            )
-
-            current_lower_bound = safe_upper_bound
-            global_seq += 1
-
-            # Batch insert to bookkeeping to save memory
-            if len(chunks_to_insert) >= 1000:
-                db.chunks.insert_many(chunks_to_insert)
-                chunks_to_insert = []
+        # Route ALL collections through the universal index walk planner
+        logging.info(f"Using universal index walk planner for {src_coll_name}.")
+        global_seq = _plan_chunks_index_walk(
+            coll, coll_config, job_config, db, global_seq, global_min_id
+        )
 
     # STOP CLOCK
     planning_duration = time.time() - planning_start_time
-
-    if chunks_to_insert:
-        db.chunks.insert_many(chunks_to_insert)
 
     db.jobs.update_one(
         {"job_id": job_config["job_id"]},
@@ -928,6 +620,7 @@ def direct_stream_worker(worker_id: str, job_config: dict):
     src_client = MongoClient(job_config["source_uri"])
     dest_client = MongoClient(job_config["dest_uri"])
     bk_client = MongoClient(job_config["bookkeeping_uri"])
+    dlq_coll = bk_client["masking_control"]["dead_letters"]
 
     chunks_coll = bk_client["masking_control"]["chunks"]
 
@@ -982,21 +675,41 @@ def direct_stream_worker(worker_id: str, job_config: dict):
             )
 
             batch = []
+            dead_letters = []
             docs_read = 0
+            docs_with_substitution = 0
             write_stats = _empty_write_stats()
             field_mask_counts = {}
 
             for doc in cursor:
                 docs_read += 1
-                for path, cnt in _count_masked_fields(doc, chunk_rules).items():
-                    field_mask_counts[path] = field_mask_counts.get(path, 0) + cnt
-                transformed_doc = transform_document(
+
+                transformed_doc, substitutions = transform_document(
                     doc,
                     chunk_rules,
                     job_config["hash_salt_bytes"],
                 )
                 batch.append(transformed_doc)
 
+                # Tally masked field counts for the audit report
+                for path, cnt in _count_masked_fields(doc, chunk_rules).items():
+                    field_mask_counts[path] = field_mask_counts.get(path, 0) + cnt
+
+                # Doc always goes to destination; log substitutions to dead_letters
+                if substitutions:
+                    docs_with_substitution += 1
+                    dead_letters.append(
+                        {
+                            "job_id": job_config["job_id"],
+                            "chunk_sequence": chunk["chunk_sequence"],
+                            "source_collection": src_coll_name,
+                            "document_id": doc.get("_id"),
+                            "substituted_reasons": substitutions,
+                            "flagged_at": datetime.now(timezone.utc),
+                        }
+                    )
+
+                # 4. Flush destination batch
                 if len(batch) >= job_config["dest_batch_size"]:
                     _merge_write_stats(
                         write_stats,
@@ -1004,18 +717,28 @@ def direct_stream_worker(worker_id: str, job_config: dict):
                     )
                     batch = []
 
+                # 5. Flush DLQ batch to avoid memory bloat
+                if len(dead_letters) >= 1000:
+                    dlq_coll.insert_many(dead_letters)
+                    dead_letters = []
+
             if batch:
                 _merge_write_stats(
                     write_stats,
                     write_dest_batch(dest_coll, batch, job_config),
                 )
 
+            if dead_letters:
+                dlq_coll.insert_many(dead_letters)
+
             chunks_coll.update_one(
                 {"_id": chunk["_id"]},
                 {
                     "$set": {
                         "status": "LOADED",
+                        "docs_read": docs_read,
                         "docs_written": docs_read,
+                        "docs_with_substitution": docs_with_substitution,
                         "field_mask_counts": field_mask_counts,
                         "stream_duration": time.time() - start_time,
                         "dest_write_mode": _get_dest_write_mode(job_config),
@@ -1102,7 +825,18 @@ def mongodump_worker(worker_id: str, job_config: dict):
                 shutil.rmtree(chunk_dir)
             os.makedirs(chunk_dir)
 
-            query_str = f'{{"_id": {{"$gte": {{"$oid": "{str(chunk["lower_bound"])}"}}, "$lt": {{"$oid": "{str(chunk["upper_bound"])}"}} }} }}'
+            # Build the query dynamically based on bounds
+            lower = chunk.get("lower_bound")
+            upper = chunk.get("upper_bound")
+            query_dict = {}
+
+            if lower is not None and upper is not None:
+                query_dict = {"_id": {"$gte": lower, "$lt": upper}}
+            elif lower is not None:
+                query_dict = {"_id": {"$gte": lower}}  # Open-ended last chunk
+
+            # json_util safely converts Python types to Mongo Extended JSON strings
+            query_str = json_util.dumps(query_dict)
 
             cmd = [
                 "mongodump",
@@ -1164,6 +898,7 @@ def bson_load_worker(worker_id: str, job_config: dict):
     dest_client = MongoClient(job_config["dest_uri"])
     bk_client = MongoClient(job_config["bookkeeping_uri"])
     chunks_coll = bk_client["masking_control"]["chunks"]
+    dlq_coll = bk_client["masking_control"]["dead_letters"]
 
     while True:
         chunk = lease_next_chunk(
@@ -1198,7 +933,9 @@ def bson_load_worker(worker_id: str, job_config: dict):
 
             bson_file = chunk.get("bson_file_path")
             batch = []
-            docs_written = 0
+            dead_letters = []
+            docs_read = 0
+            docs_with_substitution = 0
             write_stats = _empty_write_stats()
             field_mask_counts = {}
 
@@ -1206,17 +943,34 @@ def bson_load_worker(worker_id: str, job_config: dict):
                 # Stream BSON file iteratively (Crucial for memory safety)
                 with open(bson_file, "rb") as f:
                     for doc in bson.decode_file_iter(f):
-                        docs_written += 1
-                        for path, cnt in _count_masked_fields(doc, chunk_rules).items():
-                            field_mask_counts[path] = (
-                                field_mask_counts.get(path, 0) + cnt
-                            )
-                        transformed_doc = transform_document(
+                        docs_read += 1
+
+                        transformed_doc, substitutions = transform_document(
                             doc,
                             chunk_rules,
                             job_config["hash_salt_bytes"],
                         )
                         batch.append(transformed_doc)
+
+                        # Tally masked field counts for the audit report
+                        for path, cnt in _count_masked_fields(doc, chunk_rules).items():
+                            field_mask_counts[path] = (
+                                field_mask_counts.get(path, 0) + cnt
+                            )
+
+                        # Doc always goes to destination; log substitutions to dead_letters
+                        if substitutions:
+                            docs_with_substitution += 1
+                            dead_letters.append(
+                                {
+                                    "job_id": job_config["job_id"],
+                                    "chunk_sequence": chunk["chunk_sequence"],
+                                    "source_collection": src_coll_name,
+                                    "document_id": doc.get("_id"),
+                                    "substituted_reasons": substitutions,
+                                    "flagged_at": datetime.now(timezone.utc),
+                                }
+                            )
 
                         if len(batch) >= job_config["dest_batch_size"]:
                             _merge_write_stats(
@@ -1225,11 +979,17 @@ def bson_load_worker(worker_id: str, job_config: dict):
                             )
                             batch = []
 
+                        if len(dead_letters) >= 1000:
+                            dlq_coll.insert_many(dead_letters)
+                            dead_letters = []
+
                 if batch:
                     _merge_write_stats(
                         write_stats,
                         write_dest_batch(dest_coll, batch, job_config),
                     )
+                if dead_letters:
+                    dlq_coll.insert_many(dead_letters)
 
             # Transition to loaded, then trigger cleanup immediately
             chunks_coll.update_one(
@@ -1237,7 +997,9 @@ def bson_load_worker(worker_id: str, job_config: dict):
                 {
                     "$set": {
                         "status": "LOADED",
-                        "docs_written": docs_written,
+                        "docs_read": docs_read,
+                        "docs_written": docs_read,
+                        "docs_with_substitution": docs_with_substitution,
                         "field_mask_counts": field_mask_counts,
                         "dest_write_mode": _get_dest_write_mode(job_config),
                         "docs_inserted": write_stats.get("docs_inserted", 0),

@@ -233,6 +233,120 @@ def show_audit_report(config_data: dict):
 
         console.print(Panel(t, title="[bold]Masking Audit Report[/bold]", border_style="cyan"))
         console.print(f"[dim]Total docs written: {total_docs_all:,}[/dim]")
+
+        # ---- Quarantine Report ----
+        dlq_counts = {
+            doc["_id"]: doc["count"]
+            for doc in db.dead_letters.aggregate([
+                {"$match": {"job_id": job_id}},
+                {"$group": {"_id": "$source_collection", "count": {"$sum": 1}}},
+            ])
+        }
+
+        if dlq_counts:
+            qt = Table(box=box.SIMPLE_HEAVY, show_header=True, padding=(0, 2))
+            qt.add_column("Collection", style="dim")
+            qt.add_column("Docs Substituted", justify="right", style="yellow")
+            qt.add_column("Sample Reasons", style="yellow")
+
+            for coll_name in sorted(dlq_counts):
+                count = dlq_counts[coll_name]
+                samples = list(db.dead_letters.find(
+                    {"job_id": job_id, "source_collection": coll_name},
+                    {"substituted_reasons": 1, "document_id": 1},
+                    limit=5,
+                ))
+                reasons = []
+                for s in samples:
+                    doc_id = str(s.get("document_id", "?"))
+                    # substituted_reasons is now a list of strings
+                    raw = s.get("substituted_reasons", ["unknown"])
+                    reason = raw[0] if isinstance(raw, list) else str(raw)
+                    if len(reason) > 80:
+                        reason = reason[:77] + "..."
+                    reasons.append(f"[dim]_id={doc_id}[/dim] {reason}")
+                qt.add_row(coll_name, f"{count:,}", "\n".join(reasons))
+
+            console.print(Panel(qt, title="[bold yellow]Substitution Report[/bold yellow]", border_style="yellow"))
+            console.print(
+                "[dim]Affected docs reached destination with [bold]MASKED_UNSUPPORTED[/bold] in place of unmaskable fields. "
+                "Full records in [bold]masking_control.dead_letters[/bold].[/dim]"
+            )
+    finally:
+        db.client.close()
+
+
+# ==========================================
+# JOB SUMMARY
+# ==========================================
+
+def show_job_summary(config_data: dict):
+    """
+    Pull the final job record from the bookkeeping DB and display a mode-aware
+    summary panel. MONGODUMP_STAGE gets dump size / MB/sec; DIRECT_STREAM skips
+    those. Write-mode breakdown is shown for both.
+    """
+    db = get_bookkeeping_db(config_data)
+    if db is None:
+        return
+
+    try:
+        job = db.jobs.find_one({"job_id": config_data["job_id"]})
+        if not job:
+            return
+
+        mode       = job.get("mode", config_data.get("mode", "DIRECT_STREAM"))
+        status     = job.get("status", "?")
+        write_mode = job.get("dest_write_mode", "UPSERT")
+
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column(style="dim", min_width=20)
+        t.add_column()
+
+        # Status
+        color = "green" if status == "COMPLETED" else "yellow" if "PARTIAL" in status else "red"
+        t.add_row("Status",      f"[{color}]{status}[/{color}]")
+
+        # Runtime
+        runtime = job.get("total_runtime_seconds", 0)
+        t.add_row("Runtime",     f"{runtime:,.2f}s")
+
+        # Core counts
+        t.add_row("Docs Written",    f"{job.get('total_docs_written', 0):,}")
+        t.add_row("Chunks Done",     str(job.get("completed_chunks", 0)))
+        t.add_row("Docs/sec",        f"{job.get('effective_docs_per_second', 0):,.1f}")
+
+        # Write breakdown — varies by write mode
+        inserted  = job.get("total_docs_inserted", 0)
+        matched   = job.get("total_docs_matched", 0)
+        modified  = job.get("total_docs_modified", 0)
+        upserted  = job.get("total_docs_upserted", 0)
+        dup_errs  = job.get("total_duplicate_key_errors", 0)
+
+        t.add_row("Write Mode", write_mode)
+        if write_mode == "INSERT_THEN_UPSERT_ON_DUP":
+            detail = f"{inserted:,} inserted"
+            if upserted > 0:
+                detail += f"  |  {upserted:,} upserted on resume"
+            if dup_errs > 0:
+                detail += f"  |  [yellow]{dup_errs:,} dup key errors[/yellow]"
+        else:  # UPSERT
+            detail = f"{matched:,} matched  |  {modified:,} modified  |  {upserted:,} upserted"
+        t.add_row("Write Detail", detail)
+
+        # MONGODUMP_STAGE-only fields
+        if mode == "MONGODUMP_STAGE":
+            dump_bytes = job.get("total_dump_bytes", 0)
+            mb = dump_bytes / (1024 * 1024)
+            t.add_row("Dump Size",  f"{mb:,.1f} MB")
+            t.add_row("MB/sec",     f"{job.get('effective_mb_per_second', 0):,.2f}")
+
+        finished = job.get("finished_at")
+        if finished:
+            t.add_row("Finished At", finished.strftime("%Y-%m-%d %H:%M:%S UTC") if hasattr(finished, "strftime") else str(finished))
+
+        console.print(Panel(t, title="[bold]Job Summary[/bold]", border_style="green"))
+
     finally:
         db.client.close()
 
@@ -368,6 +482,12 @@ def build_status_panel(db, job_id: str, start_time: float, running=None) -> Pane
     running=None: infer from active chunk states (used in monitor-only mode).
     """
     try:
+        # Job record — planning stats live here, not on chunks
+        job_rec = db.jobs.find_one(
+            {"job_id": job_id},
+            {"status": 1, "total_chunks": 1, "planning_duration_seconds": 1},
+        ) or {}
+
         dist = {
             doc["_id"]: doc["count"]
             for doc in db.chunks.aggregate([
@@ -386,15 +506,31 @@ def build_status_panel(db, job_id: str, start_time: float, running=None) -> Pane
         if running is None:
             running = (in_prog + remaining) > 0
 
-        docs_agg = list(db.chunks.aggregate([
+        completed_agg = list(db.chunks.aggregate([
             {"$match": {"job_id": job_id, "status": {"$in": ["LOADED", "RAW_DELETED"]}}},
-            {"$group": {"_id": None, "total": {"$sum": "$docs_written"}}},
+            {"$group": {"_id": None, "docs_written": {"$sum": "$docs_written"}}},
         ]))
-        total_docs = docs_agg[0]["total"] if docs_agg else 0
+        total_docs = completed_agg[0]["docs_written"] if completed_agg else 0
+
+        # Query dead_letters directly for a live count — workers flush every 1000 bad
+        # docs so this reflects mid-chunk quarantines, not just completed chunks.
+        total_quarantined = db.dead_letters.count_documents({"job_id": job_id})
+
+        # Build planning / progress rows
+        job_phase = job_rec.get("status", "")
+        plan_secs = job_rec.get("planning_duration_seconds")
+        planned_total = job_rec.get("total_chunks")  # set by planner on completion
 
         if total == 0:
-            bar = "[cyan]Planning chunks...[/cyan]" if running else "[yellow]No chunks found — job may have done nothing[/yellow]"
+            # Still in planning phase
+            planning_row = "[cyan]Planning chunks...[/cyan]" if running else "[yellow]No chunks found[/yellow]"
+            bar = None
         else:
+            # Planning done — show a summary line and the progress bar
+            if plan_secs is not None and planned_total is not None:
+                planning_row = f"[green]✓ {planned_total:,} chunks in {plan_secs:.1f}s[/green]  →  [cyan]Loading data...[/cyan]" if running else f"[green]✓ {planned_total:,} chunks in {plan_secs:.1f}s[/green]"
+            else:
+                planning_row = f"[green]✓ {total:,} chunks[/green]"
             pct    = loaded / total * 100
             filled = int(pct / 5)
             bar    = f"[{'█' * filled}{'░' * (20 - filled)}] {loaded}/{total} ({pct:.1f}%)"
@@ -404,17 +540,26 @@ def build_status_panel(db, job_id: str, start_time: float, running=None) -> Pane
         status_str  = "[bold green]RUNNING[/bold green]" if running else "[bold cyan]COMPLETE[/bold cyan]"
 
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
-        t.add_column(style="dim", min_width=14)
+        t.add_column(style="dim", min_width=16)
         t.add_column()
 
-        t.add_row("Status",       status_str)
-        t.add_row("Elapsed",      elapsed_str)
-        t.add_row("Progress",     bar)
-        t.add_row("In Progress",  str(in_prog))
-        t.add_row("Remaining",    str(remaining))
-        t.add_row("Failed",       f"[red]{failed}[/red]" if failed else "0")
-        t.add_row("Quarantined",  f"[red]{quarantine}[/red]" if quarantine else "0")
-        t.add_row("Docs Written", f"{total_docs:,}")
+        t.add_row("Status",    status_str)
+        t.add_row("Elapsed",   elapsed_str)
+        t.add_row("Planning",  planning_row)
+        if bar:
+            t.add_row("Progress",  bar)
+            t.add_row("In Progress", str(in_prog))
+            t.add_row("Remaining",   str(remaining))
+        t.add_row("Failed",      f"[red]{failed}[/red]" if failed else "0")
+        t.add_row("Quarantined", f"[red]{quarantine}[/red]" if quarantine else "0")
+        t.add_row("Docs Written",     f"{total_docs:,}")
+        if total_quarantined == 0:
+            substitution_display = "0"
+        elif total_quarantined < 1000:
+            substitution_display = f"[yellow]{total_quarantined:,}[/yellow]"
+        else:
+            substitution_display = f"[bold red]{total_quarantined:,}  ⚠  high substitution rate — check dead_letters[/bold red]"
+        t.add_row("Docs Substituted", substitution_display)
         t.add_row("Last Refresh", datetime.now().strftime("%H:%M:%S"))
 
         border = "cyan" if running else "green"
@@ -530,6 +675,7 @@ def launch_job(selected_config: str, config_data: dict, env_vars: dict):
             console.print("[dim]Change job_id in your config file to start a fresh migration.[/dim]\n")
         else:
             console.print("\n[bold green]✓ Job completed successfully.[/bold green]\n")
+            show_job_summary(config_data)
             show_audit_report(config_data)
     else:
         console.print(f"\n[bold red]✗ ETL exited with code {proc.returncode}. Check {log_path}[/bold red]")

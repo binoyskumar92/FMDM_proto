@@ -4,7 +4,8 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 
 # --- CONFIGURATION ---
-MONGO_URI = "mongodb+srv://mongoadmin:passwordone@cluster0.hvabt.mongodb.net/"
+import os
+MONGO_URI = os.environ["FMDM_DATAGEN_URI"]  # e.g. export FMDM_DATAGEN_URI="mongodb+srv://user:pass@host/"
 DB_NAME = "sample_airbnb"
 SOURCE_COLLECTION = "listingsAndReviews_loadtest"
 TARGET_COLLECTION = "listingsAndReviews_loadtest_push"
