@@ -4,3 +4,9 @@ config.json
 Apurvs code/
 .vscode/
 ec2-helper.txt
+config copy.json
+etl_proto.zip
+etl_proto-*/
+etl_benchmark.txt
+etl_wizard.txt
+*.log
